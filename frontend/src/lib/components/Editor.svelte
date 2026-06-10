@@ -1,14 +1,11 @@
 <script>
-	import { onMount, onDestroy } from 'svelte';
-	import { writable } from 'svelte/store';
+	import { onMount } from 'svelte';
 	import toast from 'svelte-french-toast';
-	import { editorSettings, currentTranscription, editorHistory } from '$lib/stores';
+	import { editorSettings, currentTranscription, editorHistory, currentSubtitleLanguage } from '$lib/stores';
 	import EditorSettings from './EditorSettings.svelte';
 	import EditorSegment from './EditorSegment.svelte';
 	import { CLIENT_API_HOST } from '$lib/utils';
 
-
-	let language = writable('original');
 
 	// Segments lazy loading
 	let segmentsToShow = 20;
@@ -19,14 +16,14 @@
 
 	async function textFromSegments() {
 		let text = '';
-		if ($language == 'original') {
+		if ($currentSubtitleLanguage == 'original') {
 			text = $currentTranscription.result.segments
 				.map((segment) => segment.text)
 				.join(' ')
 				.replace(/(\r\n|\n|\r)/gm, ' ');
 		} else {
 			text = $currentTranscription.translations
-				.filter((translation) => translation.targetLanguage == $language)[0]
+				.filter((translation) => translation.targetLanguage == $currentSubtitleLanguage)[0]
 				.result.segments.map((segment) => segment.text)
 				.join(' ')
 				.replace(/(\r\n|\n|\r)/gm, ' ');
@@ -37,13 +34,13 @@
 
 	async function saveChanges() {
 		var url = `${CLIENT_API_HOST}/api/transcriptions`; // replace with your actual endpoint
-		console.log($language)
+		console.log($currentSubtitleLanguage)
 		// Update text to match segments
-		if ($language == 'original') {
+		if ($currentSubtitleLanguage == 'original') {
 			$currentTranscription.result.text = await textFromSegments();
 		} else {
 			$currentTranscription.translations.forEach(async (translation) => {
-				if (translation.targetLanguage == $language) translation.result.text = await textFromSegments();
+				if (translation.targetLanguage == $currentSubtitleLanguage) translation.result.text = await textFromSegments();
 			});
 		}
 
@@ -217,7 +214,7 @@
 				<span class="label-text">Subtitles language</span>
 			</label>
 			<select
-				bind:value={$language}
+				bind:value={$currentSubtitleLanguage}
 				name="language"
 				class="select select-sm select-bordered uppercase"
 			>
@@ -248,13 +245,13 @@
 				</tr>
 			</thead>
 			<tbody>
-				{#if $language == 'original'}
+				{#if $currentSubtitleLanguage == 'original'}
 					{#each $currentTranscription.result.segments.slice(0, segmentsToShow) as segment, index (segment.id)}
 						<EditorSegment {segment} {index} translationIndex={-1} />
 					{/each}
 				{:else}
 					{#each $currentTranscription.translations as translation, translationIndex}
-						{#if translation.targetLanguage == $language}
+						{#if translation.targetLanguage == $currentSubtitleLanguage}
 							{#each translation.result.segments.slice(0, segmentsToShow) as segment, index (segment.id)}
 								<EditorSegment {segment} {index} {translationIndex} />
 							{/each}
@@ -264,13 +261,13 @@
 			</tbody>
 		</table>
 		<button bind:this={loadMoreButton}>
-			{#if $language == 'original'}
+			{#if $currentSubtitleLanguage == 'original'}
 				{#if segmentsToShow >= $currentTranscription.result.segments.length}
 					No more segments to load
 				{:else}
 					Loading more...
 				{/if}
-			{:else if segmentsToShow >= $currentTranscription.translations.filter((translation) => translation.targetLanguage == $language)[0].result.segments.length}
+			{:else if segmentsToShow >= $currentTranscription.translations.filter((translation) => translation.targetLanguage == $currentSubtitleLanguage)[0].result.segments.length}
 				No more segments to load
 			{:else}
 				Loading more...
