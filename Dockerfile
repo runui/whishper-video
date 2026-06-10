@@ -18,10 +18,11 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o whishper . && \
 RUN chmod a+rx whishper
 
 # Frontend setup
-FROM node:alpine as frontend
+FROM node:20-alpine as frontend
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 RUN corepack enable
+RUN corepack prepare pnpm@8.15.9 --activate
 COPY ./frontend /app
 WORKDIR /app
 
