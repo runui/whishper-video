@@ -22,6 +22,13 @@ type Transcription struct {
 	Translations []Translation      `bson:"translations" json:"translations"`
 }
 
+func libreTranslateLanguage(language string) string {
+	if language == "zh" {
+		return "zh-Hans"
+	}
+	return language
+}
+
 func (t *Transcription) Translate(target string) error {
 	for _, translation := range t.Translations {
 		if translation.TargetLanguage == target {
@@ -36,7 +43,11 @@ func (t *Transcription) Translate(target string) error {
 
 	var translation Translation
 	translation.SourceLanguage = t.Language
-	translation.TargetLanguage = target
+	if translation.SourceLanguage == "" || translation.SourceLanguage == "auto" {
+		translation.SourceLanguage = t.Result.Language
+	}
+	translation.SourceLanguage = libreTranslateLanguage(translation.SourceLanguage)
+	translation.TargetLanguage = libreTranslateLanguage(target)
 
 	trtext, err := translate.Translate(t.Result.Text, translation.SourceLanguage, translation.TargetLanguage)
 	if err != nil {

@@ -8,6 +8,12 @@
     let targetLanguage = null;
 
     let availableLanguages = [];
+    const libreTranslateLanguageAliases = {
+        zh: 'zh-Hans'
+    };
+
+    $: sourceLanguage = tr ? libreTranslateLanguageAliases[tr.result.language] || tr.result.language : null;
+
     const getAvailableLangs = () => {
         const fetchLanguages = () => {
             fetch(`${env.PUBLIC_TRANSLATION_API_HOST}/languages`)
@@ -62,10 +68,10 @@
                       <!-- Iterate all available languages -->
                       {#each availableLanguages as lan}
                         <!-- When we find the source language -->
-                        {#if lan.code == tr.result.language}
+                        {#if lan.code == sourceLanguage}
                             <!-- Iterate all possible target languages -->
                             {#each lan.targets as t}
-                                {#if t != tr.result.language}
+                                {#if t != sourceLanguage}
                                     <option value="{t}">{t}</option>
                                 {/if}
                             {/each}
