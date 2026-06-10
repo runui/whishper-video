@@ -1,0 +1,4 @@
+ARG WHISHPER_VERSION=latest
+FROM pluja/whishper:${WHISHPER_VERSION}
+
+RUN yt-dlp -U

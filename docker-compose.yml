@@ -27,8 +27,9 @@ services:
       - .env
     tty: true
     environment:
-      LT_DISABLE_WEB_UI: True
-      LT_UPDATE_MODELS: True
+      LT_DISABLE_WEB_UI: ${LT_DISABLE_WEB_UI:-True}
+      LT_LOAD_ONLY: ${LT_LOAD_ONLY:-en,zh,es,fr,de,it,pt,ru,ja,ko,ar,hi,nl,pl,tr,uk,vi,id,th,cs,sv,da,fi,el,he}
+      LT_UPDATE_MODELS: ${LT_UPDATE_MODELS:-True}
     expose:
       - 5000
     networks:
@@ -42,8 +43,12 @@ services:
       retries: 5
 
   whishper:
-    pull_policy: always
-    image: pluja/whishper:${WHISHPER_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.whishper
+      args:
+        WHISHPER_VERSION: ${WHISHPER_VERSION:-latest}
+    image: whishper-local:${WHISHPER_VERSION:-latest}
     env_file:
       - .env
     volumes:
