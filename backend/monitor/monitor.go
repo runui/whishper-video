@@ -17,6 +17,7 @@ import (
 func StartMonitor(s *api.Server) {
 	log.Info().Msg("Starting monitor!")
 	go func() {
+		recoverRunningTranscriptions(s)
 		for {
 			// Wait for new transcription to be added to the database
 			// notification will be received through the NewTranscriptionCh channel
@@ -43,6 +44,19 @@ func StartMonitor(s *api.Server) {
 	}()
 }
 
+func recoverRunningTranscriptions(s *api.Server) {
+	runningTranscriptions := s.Db.GetRunningTranscriptions()
+	log.Debug().Msgf("Recovering running transcriptions: %v", len(runningTranscriptions))
+	for _, t := range runningTranscriptions {
+		t.Status = models.TranscriptionStatusPending
+		if _, err := s.Db.UpdateTranscription(t); err != nil {
+			log.Error().Err(err).Msg("Error recovering running transcription")
+			continue
+		}
+		s.BroadcastTranscription(t)
+	}
+}
+
 func transcribe(s *api.Server, t *models.Transcription) error {
 	// Update transcription status
 	t.Status = models.TranscriptionStatusRunning
@@ -56,12 +70,18 @@ func transcribe(s *api.Server, t *models.Transcription) error {
 
 	if t.SourceUrl != "" {
 		// Download media
-		fn, err := utils.DownloadMedia(t)
-		if err != nil {
-			log.Error().Err(err).Msg("Error downloading media")
-			return err
+		if t.FileName == "" {
+			fn, err := utils.DownloadMedia(t)
+			if err != nil {
+				log.Error().Err(err).Msg("Error downloading media")
+				return err
+			}
+			t.FileName = fn
+			if _, err := s.Db.UpdateTranscription(t); err != nil {
+				log.Error().Err(err).Msg("Error updating downloaded filename")
+				return err
+			}
 		}
-		t.FileName = fn
 		s.BroadcastTranscription(t)
 	}
 

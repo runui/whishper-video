@@ -131,11 +131,19 @@ func (s *MongoDb) GetAllTranscriptions() []*models.Transcription {
 }
 
 func (s *MongoDb) GetPendingTranscriptions() []*models.Transcription {
+	return s.getTranscriptionsByStatus(models.TranscriptionStatusPending)
+}
+
+func (s *MongoDb) GetRunningTranscriptions() []*models.Transcription {
+	return s.getTranscriptionsByStatus(models.TranscriptionStatusRunning)
+}
+
+func (s *MongoDb) getTranscriptionsByStatus(status int) []*models.Transcription {
 	collection := s.client.Database("whishper").Collection("transcriptions")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	filter := bson.D{primitive.E{Key: "status", Value: models.TranscriptionStatusPending}}
+	filter := bson.D{primitive.E{Key: "status", Value: status}}
 	cursor, err := collection.Find(ctx, filter)
 	if err != nil {
 		log.Printf("Error getting transcriptions: %v", err)
