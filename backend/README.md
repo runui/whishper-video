@@ -23,6 +23,22 @@ This endpoint expects a form with the following fields:
 - `modelSize` (string): The model size to use (optional, if not present, the default model size will be used). The available model sizes are: `tiny`, `base`, `small`, `medium`, `large`. All variants of the model size are also available with enlgish-only models (e.g. `tiny.en`, `base.en`, etc.)
 - `language` (string): The source language for the transcription. By default it uses `auto` which will detect the language automatically. Otherwise, use a two-letter language code (e.g. `en`, `fr`, `es`, etc.)
 
+#### POST: `/emby`
+
+This endpoint receives Emby webhook events using `multipart/form-data` with a `data` field containing Emby's JSON payload. Configure Emby to send webhook events to `/emby` for new media or playback start events.
+
+- `system.notificationtest`: returns a success message without creating a transcription.
+- `library.new`: creates a transcription job for `Item.Path`.
+- `playback.start`: creates a transcription job for `Item.Path`.
+
+Emby and Whishper must see media files at the same paths, or `Item.Path` must be mapped into the Whishper container exactly as Emby reports it.
+
+Optional environment variables for Emby-created jobs:
+
+- `EMBY_LANGUAGE` (default: `auto`)
+- `EMBY_MODEL_SIZE` (default: `small`)
+- `EMBY_DEVICE` (default: `cpu`, supported: `cpu`, `cuda`)
+
 ### Flags
 
 - `-addr`: The address to listen to (default: `:8080`). Must specify the `:` before the port number.
@@ -63,4 +79,3 @@ This folder contains all the database logic. It is split into two files:
 # `monitor/`
 
 This folder contains the logic for the background monitor that checks the pending transcriptions, transcribes them and updates the database.
-

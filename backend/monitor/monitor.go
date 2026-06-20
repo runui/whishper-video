@@ -123,6 +123,9 @@ func prepareMultipartFormData(t *models.Transcription) (*bytes.Buffer, *multipar
 
 	// Read file from disk
 	filePath := filepath.Join(os.Getenv("UPLOAD_DIR"), t.FileName)
+	if t.LocalPath != "" {
+		filePath = t.LocalPath
+	}
 	file, err := os.Open(filePath)
 	if err != nil {
 		log.Error().Err(err).Msg("Error opening file")

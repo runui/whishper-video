@@ -88,6 +88,19 @@ func (s *Server) RegisterRoutes() {
 	// Static routes
 	s.Router.Static("/api/video", os.Getenv("UPLOAD_DIR"))
 
+	s.Router.Get("/emby", func(c *fiber.Ctx) error {
+		return s.handleGetEmby(c)
+	})
+
+	s.Router.Post("/emby", func(c *fiber.Ctx) error {
+		log.Debug().Msg("POST /emby")
+		err := s.handlePostEmby(c)
+		if err != nil {
+			log.Error().Err(err).Msg("Error handling POST /emby")
+		}
+		return err
+	})
+
 	// Register HTTP route for getting initial state.
 	s.Router.Get("/api/transcriptions", func(c *fiber.Ctx) error {
 		err := s.handleGetAllTranscriptions(c)

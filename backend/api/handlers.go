@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/goccy/go-json"
@@ -11,6 +12,13 @@ import (
 
 	"codeberg.org/pluja/whishper/models"
 )
+
+type embyWebhookPayload struct {
+	Event string `json:"Event"`
+	Item  struct {
+		Path string `json:"Path"`
+	} `json:"Item"`
+}
 
 func (s *Server) handleGetAllTranscriptions(c *fiber.Ctx) error {
 	transcriptions := s.Db.GetAllTranscriptions()
@@ -104,7 +112,7 @@ func (s *Server) handlePostTranscription(c *fiber.Ctx) error {
 	// Broadcast transcription to websocket clients
 	s.BroadcastTranscription(res)
 	s.NewTranscriptionCh <- true
-	
+
 	// Convert the transcription to JSON.
 	json, err := json.Marshal(res)
 	if err != nil {
@@ -118,6 +126,74 @@ func (s *Server) handlePostTranscription(c *fiber.Ctx) error {
 	return nil
 }
 
+func (s *Server) handleGetEmby(c *fiber.Ctx) error {
+	return c.JSON(fiber.Map{
+		"message": "You accessed this request incorrectly via a GET request. Configure Emby webhooks to POST multipart/form-data to /emby.",
+	})
+}
+
+func (s *Server) handlePostEmby(c *fiber.Ctx) error {
+	data := c.FormValue("data")
+	if data == "" {
+		return c.SendString("")
+	}
+
+	var payload embyWebhookPayload
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		log.Error().Err(err).Msg("Error parsing Emby webhook data")
+		return fiber.NewError(fiber.StatusBadRequest, "Bad request")
+	}
+
+	log.Debug().Msgf("Emby event detected is: %v", payload.Event)
+	if payload.Event == "system.notificationtest" {
+		log.Info().Msg("Emby test message received")
+		return c.JSON(fiber.Map{"message": "Notification test received successfully!"})
+	}
+
+	if payload.Event != "library.new" && payload.Event != "playback.start" {
+		return c.SendString("")
+	}
+
+	if payload.Item.Path == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "Missing Emby item path")
+	}
+
+	transcription := models.Transcription{
+		Language:  embyDefault("EMBY_LANGUAGE", "auto"),
+		ModelSize: embyDefault("EMBY_MODEL_SIZE", "small"),
+		Status:    models.TranscriptionStatusPending,
+		Task:      "transcribe",
+		Device:    embyDevice(),
+		FileName:  filepath.Base(payload.Item.Path),
+		LocalPath: payload.Item.Path,
+	}
+
+	res, err := s.Db.NewTranscription(&transcription)
+	if err != nil {
+		log.Error().Err(err).Msg("Error saving Emby transcription to database")
+		return fiber.NewError(fiber.StatusInternalServerError, "Internal server error")
+	}
+
+	s.BroadcastTranscription(res)
+	s.NewTranscriptionCh <- true
+	return c.SendString("")
+}
+
+func embyDefault(envName string, defaultValue string) string {
+	if value := os.Getenv(envName); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func embyDevice() string {
+	device := embyDefault("EMBY_DEVICE", "cpu")
+	if device != "cpu" && device != "cuda" {
+		return "cpu"
+	}
+	return device
+}
+
 func (s *Server) handleDeleteTranscription(c *fiber.Ctx) error {
 	// First get the transcription from the database
 	id := c.Params("id")
@@ -127,14 +203,17 @@ func (s *Server) handleDeleteTranscription(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusNotFound, "Not found")
 	}
 
-	// Then delete the file from disk
-	err := os.Remove(fmt.Sprintf("%v/%v", os.Getenv("UPLOAD_DIR"), t.FileName))
-	if err != nil {
-		log.Error().Err(err).Msgf("Error deleting file %v", t.FileName)
+	// Then delete uploaded/downloaded media from disk. Emby local paths point to a media
+	// library file and must not be removed when deleting the transcription.
+	if t.LocalPath == "" {
+		err := os.Remove(fmt.Sprintf("%v/%v", os.Getenv("UPLOAD_DIR"), t.FileName))
+		if err != nil {
+			log.Error().Err(err).Msgf("Error deleting file %v", t.FileName)
+		}
 	}
 
 	// Finally delete the transcription from the database
-	err = s.Db.DeleteTranscription(id)
+	err := s.Db.DeleteTranscription(id)
 	if err != nil {
 		log.Error().Err(err).Msgf("Error deleting transcription %v", id)
 		return fiber.NewError(fiber.StatusInternalServerError, "Internal server error")
