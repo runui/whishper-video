@@ -130,6 +130,24 @@ func (s *Server) RegisterRoutes() {
 		return err
 	})
 
+	s.Router.Get("/api/subtitles/:id/:track/:target", func(c *fiber.Ctx) error {
+		log.Debug().Msgf("GET /api/subtitles/%v/%v/%v", c.Params("id"), c.Params("track"), c.Params("target"))
+		err := s.handleTranslateSubtitleTrack(c)
+		if err != nil {
+			log.Error().Err(err).Msg("Error handling GET /api/subtitles/:id/:track/:target")
+		}
+		return err
+	})
+
+	s.Router.Post("/api/subtitles/:id/extract", func(c *fiber.Ctx) error {
+		log.Debug().Msgf("POST /api/subtitles/%v/extract", c.Params("id"))
+		err := s.handleExtractSubtitleTracks(c)
+		if err != nil {
+			log.Error().Err(err).Msg("Error handling POST /api/subtitles/:id/extract")
+		}
+		return err
+	})
+
 	// Register HTTP route for receiving the form data and creating new transcription job.
 	s.Router.Post("/api/transcriptions", func(c *fiber.Ctx) error {
 		log.Debug().Msg("POST /api/transcriptions")

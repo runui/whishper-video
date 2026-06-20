@@ -131,24 +131,60 @@ func lastNonEmptyLine(output string) string {
 	return ""
 }
 
-func SendTranscriptionRequest(t *models.Transcription, body *bytes.Buffer, writer *multipart.Writer) (*models.WhisperResult, error) {
+func SendTranscriptionRequest(t *models.Transcription, filePath string) (*models.WhisperResult, error) {
 	url := fmt.Sprintf("http://%v/transcribe?model_size=%v&task=%v&language=%v&device=%v", os.Getenv("ASR_ENDPOINT"), t.ModelSize, t.Task, t.Language, t.Device)
-	// Send transcription request to transcription service
-	req, err := http.NewRequest("POST", url, body)
+
+	file, err := os.Open(filePath)
 	if err != nil {
-		log.Debug().Err(err).Msg("Error creating request to transcription service")
+		log.Debug().Err(err).Msg("Error opening file for transcription request")
 		return nil, err
 	}
 
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	reader, writer := io.Pipe()
+	multipartWriter := multipart.NewWriter(writer)
+	errCh := make(chan error, 1)
+	go func() {
+		defer file.Close()
+		defer writer.Close()
+
+		part, err := multipartWriter.CreateFormFile("file", t.FileName)
+		if err != nil {
+			errCh <- err
+			writer.CloseWithError(err)
+			return
+		}
+
+		if _, err := io.Copy(part, file); err != nil {
+			errCh <- err
+			writer.CloseWithError(err)
+			return
+		}
+
+		errCh <- multipartWriter.Close()
+	}()
+
+	req, err := http.NewRequest("POST", url, reader)
+	if err != nil {
+		log.Debug().Err(err).Msg("Error creating request to transcription service")
+		reader.CloseWithError(err)
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
 	req.Header.Set("Accept", "application/json")
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Debug().Err(err).Msg("Error sending request")
+		reader.CloseWithError(err)
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if streamErr := <-errCh; streamErr != nil {
+		log.Debug().Err(streamErr).Msg("Error streaming transcription request")
+		return nil, streamErr
+	}
+
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Debug().Err(err).Msg("Error reading response body")

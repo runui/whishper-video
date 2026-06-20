@@ -6,13 +6,56 @@
     export let tr;
 
     let targetLanguage = null;
+    let selectedSource = 'main';
 
     let availableLanguages = [];
     const libreTranslateLanguageAliases = {
         zh: 'zh-Hans'
     };
 
-    $: sourceLanguage = tr ? libreTranslateLanguageAliases[tr.result.language] || tr.result.language : null;
+    $: sourceOptions = tr ? getSourceOptions(tr) : [];
+    $: if (sourceOptions.length > 0 && !sourceOptions.some(option => option.value == selectedSource)) {
+        selectedSource = sourceOptions[0].value;
+    }
+    $: selectedSourceOption = sourceOptions.find(option => option.value == selectedSource) || sourceOptions[0];
+    $: sourceLanguage = selectedSourceOption ? libreTranslateLanguageAliases[selectedSourceOption.language] || selectedSourceOption.language : null;
+    $: targetLanguages = getTargetLanguages(sourceLanguage, availableLanguages);
+    $: if (targetLanguage && targetLanguages.length > 0 && !targetLanguages.includes(targetLanguage)) {
+        targetLanguage = null;
+    }
+
+    function getTrackLabel(track) {
+        const title = track.title ? ` - ${track.title}` : '';
+        return `Subtitle ${track.index} (${track.language || 'unknown'}${title})`;
+    }
+
+    function getSourceOptions(transcription) {
+        const options = [];
+        if (!transcription.skipWhisper || transcription.result?.segments?.length > 0) {
+            options.push({ value: 'main', label: `Transcription (${transcription.result.language})`, language: transcription.result.language });
+        }
+        for (const track of transcription.subtitleTracks || []) {
+            options.push({ value: `subtitle:${track.id}`, label: getTrackLabel(track), language: track.language || 'auto' });
+        }
+        return options;
+    }
+
+    function getTargetLanguages(source, languages) {
+        if (!languages || languages.length == 0) {
+            return [];
+        }
+
+        if (!source || source == 'auto' || source == 'und' || source == 'unknown') {
+            return [...new Set(languages.flatMap(language => language.targets || []).filter(Boolean))].sort();
+        }
+
+        const sourceEntry = languages.find(language => language.code == source);
+        if (sourceEntry?.targets?.length > 0) {
+            return sourceEntry.targets.filter(target => target != source).sort();
+        }
+
+        return [...new Set(languages.map(language => language.code).filter(code => code && code != source))].sort();
+    }
 
     const getAvailableLangs = () => {
         const fetchLanguages = () => {
@@ -34,7 +77,9 @@
 
     const handleTranslate = (id) => {
         if(targetLanguage) {
-            const url = `${CLIENT_API_HOST}/api/translate/${id}/${targetLanguage}`;
+            const url = selectedSource == 'main'
+                ? `${CLIENT_API_HOST}/api/translate/${id}/${targetLanguage}`
+                : `${CLIENT_API_HOST}/api/subtitles/${id}/${selectedSource.split(':')[1]}/${targetLanguage}`;
             fetch(url)
             .then(() => toast.success('Translation started!'))
             .catch(error => {
@@ -58,24 +103,25 @@
                 Translate
             </h1>
             <div>
+                <div class="w-full max-w-xs form-control">
+                    <label for="source-track" class="label">
+                      <span class="label-text">Source text</span>
+                    </label>
+                    <select bind:value={selectedSource} name="source-track" class="select select-bordered">
+                      {#each sourceOptions as source}
+                        <option value={source.value}>{source.label}</option>
+                      {/each}
+                    </select>
+                </div>
                 <!-- Language picker -->
                 <div class="w-full max-w-xs form-control">
                     <label for="target-lan" class="label">
-                      <span class="label-text">Target languages for {tr.result.language}</span>
+                      <span class="label-text">Target languages for {sourceLanguage || 'selected source'}</span>
                     </label>
                     <select bind:value={targetLanguage} name="target-lan" class="select select-bordered">
                       <option disabled selected>Pick one</option>
-                      <!-- Iterate all available languages -->
-                      {#each availableLanguages as lan}
-                        <!-- When we find the source language -->
-                        {#if lan.code == sourceLanguage}
-                            <!-- Iterate all possible target languages -->
-                            {#each lan.targets as t}
-                                {#if t != sourceLanguage}
-                                    <option value="{t}">{t}</option>
-                                {/if}
-                            {/each}
-                        {/if}
+                      {#each targetLanguages as t}
+                        <option value="{t}">{t}</option>
                       {/each}
                     </select>
                 </div>

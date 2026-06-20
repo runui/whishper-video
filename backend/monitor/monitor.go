@@ -1,9 +1,6 @@
 package monitor
 
 import (
-	"bytes"
-	"io"
-	"mime/multipart"
 	"os"
 	"path/filepath"
 
@@ -85,15 +82,24 @@ func transcribe(s *api.Server, t *models.Transcription) error {
 		s.BroadcastTranscription(t)
 	}
 
-	// Prepare multipart form data
-	body, writer, err := prepareMultipartFormData(t)
-	if err != nil {
-		log.Error().Err(err).Msg("Error preparing multipart form data")
-		return err
+	if err := extractSubtitleTracks(s, t); err != nil {
+		log.Debug().Err(err).Msg("Error extracting subtitle tracks")
+	}
+
+	if t.SkipWhisper {
+		t.Result = subtitleOnlyResult(t)
+		t.Translations = []models.Translation{}
+		t.Status = models.TranscriptionStatusDone
+		if _, err := s.Db.UpdateTranscription(t); err != nil {
+			log.Error().Err(err).Msg("Error updating subtitle-only transcription")
+			return err
+		}
+		s.BroadcastTranscription(t)
+		return nil
 	}
 
 	// Send transcription request to transcription service
-	res, err := utils.SendTranscriptionRequest(t, body, writer)
+	res, err := utils.SendTranscriptionRequest(t, transcriptionFilePath(t))
 	if err != nil {
 		log.Error().Err(err).Msg("Error sending transcription request")
 		return err
@@ -111,39 +117,38 @@ func transcribe(s *api.Server, t *models.Transcription) error {
 	return nil
 }
 
-func prepareMultipartFormData(t *models.Transcription) (*bytes.Buffer, *multipart.Writer, error) {
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-
-	part, err := writer.CreateFormFile("file", t.FileName)
-	if err != nil {
-		log.Error().Err(err).Msg("Error creating form file")
-		return nil, nil, err
+func subtitleOnlyResult(t *models.Transcription) models.WhisperResult {
+	if len(t.SubtitleTracks) > 0 {
+		result := t.SubtitleTracks[0].Result
+		result.Text = "Subtitle tracks extracted. Select a subtitle track to download or translate."
+		result.Segments = []models.Segment{}
+		return result
 	}
 
-	// Read file from disk
-	filePath := filepath.Join(os.Getenv("UPLOAD_DIR"), t.FileName)
+	return models.WhisperResult{
+		Language: t.Language,
+		Text:     "No subtitle tracks found. Whisper transcription was skipped.",
+		Segments: []models.Segment{},
+	}
+}
+
+func extractSubtitleTracks(s *api.Server, t *models.Transcription) error {
+	tracks, err := utils.ExtractSubtitleTracks(transcriptionFilePath(t))
+	if err != nil {
+		return err
+	}
+	utils.SortSubtitleTracks(tracks)
+	t.SubtitleTracks = tracks
+	if _, err := s.Db.UpdateTranscription(t); err != nil {
+		return err
+	}
+	s.BroadcastTranscription(t)
+	return nil
+}
+
+func transcriptionFilePath(t *models.Transcription) string {
 	if t.LocalPath != "" {
-		filePath = t.LocalPath
+		return t.LocalPath
 	}
-	file, err := os.Open(filePath)
-	if err != nil {
-		log.Error().Err(err).Msg("Error opening file")
-		return nil, nil, err
-	}
-	defer file.Close()
-
-	_, err = io.Copy(part, file)
-	if err != nil {
-		log.Error().Err(err).Msg("Error copying file")
-		return nil, nil, err
-	}
-
-	err = writer.Close()
-	if err != nil {
-		log.Error().Err(err).Msg("Error closing writer")
-		return nil, nil, err
-	}
-
-	return body, writer, nil
+	return filepath.Join(os.Getenv("UPLOAD_DIR"), t.FileName)
 }

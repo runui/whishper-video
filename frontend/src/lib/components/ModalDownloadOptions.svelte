@@ -4,31 +4,50 @@
     export let tr;
 
     let subtitleFormat = "srt";
-    let language = "original";
+    let selectedText = "main:original";
 
-    function downloadSubtitle() {
-        console.log("download subtitle");
-        let segments = [];
-        let text = "";
-        let title = "subtitles";
+    $: textOptions = tr ? getTextOptions(tr) : [];
+    $: if (textOptions.length > 0 && !textOptions.some(option => option.value == selectedText)) {
+        selectedText = textOptions[0].value;
+    }
 
-        console.log(language)
-        if (language == "original") {
-            segments = tr.result.segments;
-            text = tr.result.text;
-            title = tr.fileName.split("_WHSHPR_")[1]
-        } else {
-            for (const translation of tr.translations) {
-                if (translation.targetLanguage == language) {
-                    segments = translation.result.segments;
-                    text = translation.result.text;
-                    title = tr.fileName.split("_WHSHPR_")[1]
-                    break;
-                }
+    function getMediaTitle(transcription) {
+        return transcription.fileName.includes("_WHSHPR_") ? transcription.fileName.split("_WHSHPR_")[1] : transcription.fileName;
+    }
+
+    function getTrackLabel(track) {
+        const title = track.title ? ` - ${track.title}` : '';
+        return `Subtitle ${track.index} (${track.language || 'unknown'}${title})`;
+    }
+
+    function getTextOptions(transcription) {
+        const options = [];
+        if (!transcription.skipWhisper || transcription.result?.segments?.length > 0) {
+            options.push({ value: 'main:original', label: `Transcription (${transcription.result.language})`, result: transcription.result });
+        }
+        for (const translation of transcription.translations || []) {
+            options.push({ value: `main:${translation.targetLanguage}`, label: `Translation (${translation.targetLanguage})`, result: translation.result });
+        }
+        for (const track of transcription.subtitleTracks || []) {
+            options.push({ value: `subtitle:${track.id}:original`, label: `${getTrackLabel(track)} original`, result: track.result });
+            for (const translation of track.translations || []) {
+                options.push({ value: `subtitle:${track.id}:${translation.targetLanguage}`, label: `${getTrackLabel(track)} translated ${translation.targetLanguage}`, result: translation.result });
             }
         }
+        return options;
+    }
+
+    function selectedOption() {
+        return textOptions.find(option => option.value == selectedText) || textOptions[0];
+    }
+
+    function downloadSubtitle() {
+        const option = selectedOption();
+        const segments = option?.result?.segments || [];
+        const text = option?.result?.text || "";
+        const title = getMediaTitle(tr);
         
-        if (segments.length == 0 || text == "") {
+        if (!option || segments.length == 0 || text == "") {
             toast.error("No data available for download");
             return;
         }
@@ -38,7 +57,7 @@
         } else if (subtitleFormat == "vtt") {
             downloadVTT(segments, title);
         } else if (subtitleFormat == "json") {
-            downloadJSON(tr.result, title);
+            downloadJSON(option.result, title);
         } else if (subtitleFormat == "txt") {
             downloadTXT(text, title);
         }
@@ -53,19 +72,7 @@
     }
 
     async function copyText() {
-        console.log("copy text");
-        let text = "";
-        if (language == "original") {
-            text = tr.result.text;
-        } else {
-            for (const translation of tr.translations) {
-                console.log(translation.targetLanguage == language)
-                if (translation.targetLanguage == language) {
-                    text = translation.result.text;
-                    break;
-                }
-            }
-        }
+        const text = selectedOption()?.result?.text || "";
         // Copy tr.result.text to clipboard
         try {
             await navigator.clipboard.writeText(text);
@@ -98,19 +105,18 @@
     
             <div class="form-control">
                 <label for="language" class="label">
-                    <span class="label-text font-bold">Text Language</span>
+                    <span class="label-text font-bold">Text Source</span>
                 </label>
-                <select bind:value={language} name="language" class="select select-bordered w-full max-w-xs uppercase">
-                    <option value="original">✅ {tr.result.language}</option>
-                    {#each tr.translations as translation}
-                        <option value="{translation.targetLanguage}">🤖 {translation.targetLanguage}</option>
+                <select bind:value={selectedText} name="language" class="select select-bordered w-full max-w-xs">
+                    {#each textOptions as option}
+                        <option value={option.value}>{option.label}</option>
                     {/each}
                 </select>
             </div>
         </div>
 
         <div class="space-x-2 mt-8">
-            <span class="tooltip" data-tip="Download {subtitleFormat} file in {language}.">
+            <span class="tooltip" data-tip="Download selected text as {subtitleFormat}.">
                 <button on:click={downloadSubtitle} class="btn btn-sm btn-success">
                     <svg xmlns="http://www.w3.org/2000/svg" class="icon icon-tabler icon-tabler-download" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
                         <path stroke="none" d="M0 0h24v24H0z" fill="none"></path>
@@ -123,7 +129,7 @@
                     </span>
                 </button>
             </span>
-            <span class="tooltip" data-tip="Copy raw text in '{language}' language.">
+            <span class="tooltip" data-tip="Copy selected text.">
                 <button on:click={copyText} class="btn btn-sm btn-info">
                     <svg xmlns="http://www.w3.org/2000/svg" class="icon icon-tabler icon-tabler-copy" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
                         <path stroke="none" d="M0 0h24v24H0z" fill="none"></path>

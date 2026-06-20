@@ -10,6 +10,7 @@
 	let modelSize = 'small';
 	let language = 'auto';
 	let sourceUrl = '';
+	let skipWhisper = false;
 	let fileInput;
 	let device = env.PUBLIC_WHISHPER_PROFILE == 'gpu' ? 'cuda' : 'cpu';
 
@@ -67,7 +68,7 @@
 			return;
 		}
 
-		if (!sourceUrl && !fileInput) {
+		if (!sourceUrl && (!fileInput || fileInput.files.length == 0)) {
 			toast.error('No file or URL.');
 			return;
 		}
@@ -81,6 +82,7 @@
 			formData.append('device', 'cpu');
 		}
 		formData.append('sourceUrl', sourceUrl);
+		formData.append('skipWhisper', skipWhisper ? 'true' : 'false');
 		if (sourceUrl == '') {
 			formData.append('file', fileInput.files[0]);
 		}
@@ -185,13 +187,28 @@
 		</div>
 
 		<div class="mb-0 divider" />
+		<div class="form-control">
+			<label class="justify-start gap-3 cursor-pointer label">
+				<input type="checkbox" bind:checked={skipWhisper} class="checkbox checkbox-primary" />
+				<span class="label-text">
+					Only extract embedded subtitle tracks, skip Whisper transcription
+				</span>
+			</label>
+			{#if skipWhisper}
+				<p class="text-xs opacity-70">
+					The task will read video subtitle tracks only. If no embedded subtitles exist, no audio transcription will be generated.
+				</p>
+			{/if}
+		</div>
+
+		<div class="mb-0 divider" />
 		<!-- Whisper Configuration -->
 		<div class="flex space-x-4">
 			<div class="w-full max-w-xs form-control">
 				<label for="modelSize" class="label">
 					<span class="label-text">Whisper model</span>
 				</label>
-				<select name="modelSize" bind:value={modelSize} class="select select-bordered">
+				<select name="modelSize" bind:value={modelSize} class="select select-bordered" disabled={skipWhisper}>
 					{#each models as m}
 						<option value={m}>{m}</option>
 					{/each}
@@ -213,7 +230,7 @@
 				<label for="language" class="label">
 					<span class="label-text">Device</span>
 				</label>
-				<select name="device" bind:value={device} class="select select-bordered">
+				<select name="device" bind:value={device} class="select select-bordered" disabled={skipWhisper}>
 					{#if env.PUBLIC_WHISHPER_PROFILE == 'gpu'}
 						<option selected value="cuda">GPU</option>
 						<option value="cpu">CPU</option>

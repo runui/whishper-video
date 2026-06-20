@@ -32,16 +32,55 @@
 		return text;
 	}
 
+	function getTrackLabel(track) {
+		const title = track.title ? ` - ${track.title}` : '';
+		return `Subtitle ${track.index} (${track.language || 'unknown'}${title})`;
+	}
+
+	function selectSubtitleTrack(trackId) {
+		const track = $currentTranscription.subtitleTracks?.find((track) => track.id == trackId);
+		if (!track) return;
+
+		$currentTranscription.activeSubtitleTrackId = track.id;
+		$currentTranscription.result = JSON.parse(JSON.stringify(track.result));
+		$currentTranscription.result.language = track.language || $currentTranscription.result.language;
+		$currentTranscription.translations = track.translations || [];
+		$currentSubtitleLanguage = 'original';
+		segmentsToShow = 20;
+		$currentTranscription = { ...$currentTranscription };
+	}
+
+	function displayFileName(fileName) {
+		return fileName?.includes('_WHSHPR_') ? fileName.split('_WHSHPR_')[1] : fileName;
+	}
+
 	async function saveChanges() {
 		var url = `${CLIENT_API_HOST}/api/transcriptions`; // replace with your actual endpoint
 		console.log($currentSubtitleLanguage)
 		// Update text to match segments
 		if ($currentSubtitleLanguage == 'original') {
 			$currentTranscription.result.text = await textFromSegments();
+			if ($currentTranscription.skipWhisper && $currentTranscription.activeSubtitleTrackId) {
+				const track = $currentTranscription.subtitleTracks?.find(
+					(track) => track.id == $currentTranscription.activeSubtitleTrackId
+				);
+				if (track) {
+					track.result = JSON.parse(JSON.stringify($currentTranscription.result));
+					track.language = $currentTranscription.result.language || track.language;
+				}
+			}
 		} else {
 			$currentTranscription.translations.forEach(async (translation) => {
 				if (translation.targetLanguage == $currentSubtitleLanguage) translation.result.text = await textFromSegments();
 			});
+		}
+		if ($currentTranscription.skipWhisper && $currentTranscription.activeSubtitleTrackId) {
+			const track = $currentTranscription.subtitleTracks?.find(
+				(track) => track.id == $currentTranscription.activeSubtitleTrackId
+			);
+			if (track) {
+				track.translations = $currentTranscription.translations || [];
+			}
 		}
 
 		try {
@@ -163,7 +202,7 @@
 {:else}
 <div class="flex flex-col items-center break-words">
 	<h1 class="text-center text-2xl mt-8 break-words">
-		{$currentTranscription.fileName.split('_WHSHPR_')[1]}
+		{displayFileName($currentTranscription.fileName)}
 	</h1>
 	<!-- Menu -->
 	<ul class="menu menu-horizontal bg-base-200 rounded-box mt-6">
@@ -208,7 +247,25 @@
 	</ul>
 	<!-- End Menu -->
 
-	{#if $currentTranscription.translations.length > 0}
+		{#if $currentTranscription.skipWhisper && $currentTranscription.subtitleTracks?.length > 0}
+			<div class="form-control max-w-xs my-4">
+				<label for="subtitle-track" class="label">
+					<span class="label-text">Subtitle track</span>
+				</label>
+				<select
+					value={$currentTranscription.activeSubtitleTrackId || $currentTranscription.subtitleTracks[0].id}
+					name="subtitle-track"
+					class="select select-sm select-bordered"
+					on:change={(event) => selectSubtitleTrack(event.target.value)}
+				>
+					{#each $currentTranscription.subtitleTracks as track}
+						<option value={track.id}>{getTrackLabel(track)}</option>
+					{/each}
+				</select>
+			</div>
+		{/if}
+
+		{#if $currentTranscription.translations.length > 0}
 		<div class="form-control max-w-xs my-4">
 			<label for="language" class="label">
 				<span class="label-text">Subtitles language</span>

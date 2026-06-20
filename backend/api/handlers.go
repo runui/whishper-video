@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"codeberg.org/pluja/whishper/models"
+	"codeberg.org/pluja/whishper/utils"
 )
 
 type embyWebhookPayload struct {
@@ -95,6 +96,7 @@ func (s *Server) handlePostTranscription(c *fiber.Ctx) error {
 	transcription.Status = models.TranscriptionStatusPending
 	transcription.Task = "transcribe"
 	transcription.SourceUrl = c.FormValue("sourceUrl")
+	transcription.SkipWhisper = c.FormValue("skipWhisper") == "true"
 	transcription.Device = c.FormValue("device")
 	if transcription.Device != "cpu" && transcription.Device != "cuda" {
 		log.Warn().Msgf("Device %v not supported, using cpu", transcription.Device)
@@ -205,7 +207,7 @@ func (s *Server) handleDeleteTranscription(c *fiber.Ctx) error {
 
 	// Then delete uploaded/downloaded media from disk. Emby local paths point to a media
 	// library file and must not be removed when deleting the transcription.
-	if t.LocalPath == "" {
+	if t.LocalPath == "" && t.FileName != "" {
 		err := os.Remove(fmt.Sprintf("%v/%v", os.Getenv("UPLOAD_DIR"), t.FileName))
 		if err != nil {
 			log.Error().Err(err).Msgf("Error deleting file %v", t.FileName)
@@ -283,4 +285,89 @@ func (s *Server) handleTranslate(c *fiber.Ctx) error {
 	s.Db.UpdateTranscription(transcription)
 	s.BroadcastTranscription(transcription)
 	return nil
+}
+
+func (s *Server) handleTranslateSubtitleTrack(c *fiber.Ctx) error {
+	id := c.Params("id")
+	trackID := c.Params("track")
+	targetLang := c.Params("target")
+
+	transcription := s.Db.GetTranscription(id)
+	if transcription == nil {
+		return fiber.NewError(fiber.StatusNotFound, "Not found")
+	}
+
+	trackIndex, ok := utils.FindSubtitleTrack(transcription.SubtitleTracks, trackID)
+	if !ok {
+		return fiber.NewError(fiber.StatusNotFound, "Subtitle track not found")
+	}
+
+	track := &transcription.SubtitleTracks[trackIndex]
+	for _, translation := range track.Translations {
+		if translation.TargetLanguage == targetLang {
+			return fiber.NewError(fiber.StatusBadRequest, "translation already exists")
+		}
+	}
+
+	transcription.Status = models.TrannscriptionStatusTranslating
+	s.Db.UpdateTranscription(transcription)
+	s.BroadcastTranscription(transcription)
+
+	translation, err := models.TranslateWhisperResult(track.Result, track.Language, targetLang)
+	if err != nil {
+		log.Debug().Err(err).Msg("Error translating subtitle track")
+		transcription.Status = models.TranscriptionStatusDone
+		s.Db.UpdateTranscription(transcription)
+		s.BroadcastTranscription(transcription)
+		return err
+	}
+
+	track.Translations = append(track.Translations, translation)
+	transcription.Status = models.TranscriptionStatusDone
+	ut, err := s.Db.UpdateTranscription(transcription)
+	if err != nil {
+		return err
+	}
+	s.BroadcastTranscription(ut)
+	return nil
+}
+
+func (s *Server) handleExtractSubtitleTracks(c *fiber.Ctx) error {
+	id := c.Params("id")
+	transcription := s.Db.GetTranscription(id)
+	if transcription == nil {
+		return fiber.NewError(fiber.StatusNotFound, "Not found")
+	}
+
+	mediaPath := fmt.Sprintf("%v/%v", os.Getenv("UPLOAD_DIR"), transcription.FileName)
+	if transcription.LocalPath != "" {
+		mediaPath = transcription.LocalPath
+	}
+
+	tracks, err := utils.ExtractSubtitleTracks(mediaPath)
+	if err != nil {
+		return err
+	}
+	utils.SortSubtitleTracks(tracks)
+	transcription.SubtitleTracks = tracks
+	if transcription.SkipWhisper {
+		if len(tracks) > 0 {
+			transcription.Result = tracks[0].Result
+			transcription.Result.Text = "Subtitle tracks extracted. Select a subtitle track to download or translate."
+			transcription.Result.Segments = []models.Segment{}
+		} else {
+			transcription.Result = models.WhisperResult{
+				Language: transcription.Language,
+				Text:     "No subtitle tracks found. Whisper transcription was skipped.",
+				Segments: []models.Segment{},
+			}
+		}
+	}
+
+	ut, err := s.Db.UpdateTranscription(transcription)
+	if err != nil {
+		return err
+	}
+	s.BroadcastTranscription(ut)
+	return c.JSON(ut)
 }

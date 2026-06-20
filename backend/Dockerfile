@@ -20,6 +20,7 @@ ARG TARGETOS
 ARG TARGETARCH
 
 WORKDIR /app
+RUN apt update && apt install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/whishper ./whishper 
 RUN chmod a+rx ./whishper
 COPY --from=ytdlp_cache /usr/local/bin/yt-dlp /bin/yt-dlp

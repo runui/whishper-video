@@ -24,8 +24,13 @@
             <span class="space-x-1">
                 <span class="font-bold text-xs">{tr.translations.length} translations</span>
             </span>
+            {#if tr.subtitleTracks && tr.subtitleTracks.length > 0}
+                <span class="space-x-1">
+                    <span class="font-bold text-xs">{tr.subtitleTracks.length} subtitle tracks</span>
+                </span>
+            {/if}
             <span class="space-x-1">
-                <span class="font-bold text-xs">{tr.result.text.split(" ").length} words</span>
+                <span class="font-bold text-xs">{tr.skipWhisper ? 'Whisper skipped' : `${tr.result.text.split(" ").length} words`}</span>
             </span>
         </p>
     </span>
