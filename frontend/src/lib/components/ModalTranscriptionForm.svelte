@@ -172,13 +172,13 @@
 
 			<div class="w-full max-w-xs form-control">
 				<label for="sourceUrl" class="label">
-					<span class="label-text">Or a source URL</span>
+					<span class="label-text">Or any video URL</span>
 				</label>
 				<input
 					name="sourceUrl"
 					bind:value={sourceUrl}
 					type="text"
-					placeholder="https://youtube.com/watch?v=Hd33fCdW"
+					placeholder="Paste a video page or direct media link"
 					class="w-full max-w-xs input input-sm input-bordered input-primary"
 				/>
 			</div>
