@@ -9,7 +9,14 @@
 	let disableSubmit = true;
 	let modelSize = 'small';
 	let language = 'auto';
+	let sourceType = 'file';
 	let sourceUrl = '';
+	let localPath = '';
+	let localPathEntries = [];
+	let localPathLoading = false;
+	let localPathError = '';
+	let localPathSuggestionsVisible = false;
+	let localPathBrowseTimer;
 	let skipWhisper = false;
 	let fileInput;
 	let device = env.PUBLIC_WHISHPER_PROFILE == 'gpu' ? 'cuda' : 'cpu';
@@ -63,13 +70,25 @@
 
 	// Function that sends the data as a form to the backend
 	async function sendForm() {
-		if (sourceUrl && !validateURL(sourceUrl)) {
+		if (sourceType == 'url' && sourceUrl && !validateURL(sourceUrl)) {
 			toast.error('You must enter a valid URL.');
 			return;
 		}
+		if (sourceType == 'local' && localPath && !localPath.startsWith('/')) {
+			toast.error('Container file path must be absolute.');
+			return;
+		}
 
-		if (!sourceUrl && (!fileInput || fileInput.files.length == 0)) {
-			toast.error('No file or URL.');
+		if (sourceType == 'file' && (!fileInput || fileInput.files.length == 0)) {
+			toast.error('No file selected.');
+			return;
+		}
+		if (sourceType == 'url' && sourceUrl == '') {
+			toast.error('No URL entered.');
+			return;
+		}
+		if (sourceType == 'local' && localPath == '') {
+			toast.error('No container path entered.');
 			return;
 		}
 
@@ -81,9 +100,10 @@
 		} else {
 			formData.append('device', 'cpu');
 		}
-		formData.append('sourceUrl', sourceUrl);
+		formData.append('sourceUrl', sourceType == 'url' ? sourceUrl : '');
+		formData.append('localPath', sourceType == 'local' ? localPath : '');
 		formData.append('skipWhisper', skipWhisper ? 'true' : 'false');
-		if (sourceUrl == '') {
+		if (sourceType == 'file') {
 			formData.append('file', fileInput.files[0]);
 		}
 
@@ -123,15 +143,95 @@
 
 		// Set file and sourceUrl to empty
 		sourceUrl = '';
-		fileInput.value = '';
+		localPath = '';
+		localPathEntries = [];
+		if (fileInput) fileInput.value = '';
 		uploadProgress.set(0);
 
 		toast.success('Success!');
 	}
 
 	// Reactive statement
-	$: if (sourceUrl && !validateURL(sourceUrl)) {
+	function localPathDirectory(path) {
+		if (!path || !path.startsWith('/')) return '';
+		if (path.endsWith('/')) return path;
+		const index = path.lastIndexOf('/');
+		return index <= 0 ? '/' : path.slice(0, index + 1);
+	}
+
+	function localPathPrefix(path) {
+		if (!path || path.endsWith('/')) return '';
+		const index = path.lastIndexOf('/');
+		return index < 0 ? path : path.slice(index + 1).toLowerCase();
+	}
+
+	async function browseLocalPath() {
+		if (sourceType != 'local' || !localPath.startsWith('/')) {
+			localPathEntries = [];
+			localPathError = '';
+			localPathSuggestionsVisible = false;
+			return;
+		}
+
+		const directory = localPathDirectory(localPath);
+		if (!directory) return;
+		localPathLoading = true;
+		localPathError = '';
+		try {
+			const response = await fetch(`${CLIENT_API_HOST}/api/files?path=${encodeURIComponent(directory)}`);
+			if (!response.ok) throw new Error(`HTTP ${response.status}`);
+			const data = await response.json();
+			const prefix = localPathPrefix(localPath);
+			localPathEntries = (data.entries || []).filter((entry) => {
+				if (!prefix) return true;
+				return entry.name.toLowerCase().startsWith(prefix);
+			}).sort((a, b) => {
+				if (a.isDir != b.isDir) return a.isDir ? -1 : 1;
+				return a.name.localeCompare(b.name);
+			});
+			localPathSuggestionsVisible = true;
+		} catch (error) {
+			console.error(error);
+			localPathEntries = [];
+			localPathError = '';
+			localPathSuggestionsVisible = false;
+		} finally {
+			localPathLoading = false;
+		}
+	}
+
+	function scheduleLocalPathBrowse() {
+		localPathSuggestionsVisible = true;
+		clearTimeout(localPathBrowseTimer);
+		localPathBrowseTimer = setTimeout(browseLocalPath, 250);
+	}
+
+	function hideLocalPathSuggestions() {
+		localPathSuggestionsVisible = false;
+	}
+
+	function handleLocalPathKeydown(event) {
+		if (event.key == 'Escape') {
+			hideLocalPathSuggestions();
+		}
+	}
+
+	function selectLocalPath(entry) {
+		localPath = entry.path;
+		if (entry.isDir) {
+			localPathSuggestionsVisible = true;
+			scheduleLocalPathBrowse();
+		} else {
+			localPathEntries = [];
+			hideLocalPathSuggestions();
+		}
+	}
+
+	$: if (sourceType == 'url' && sourceUrl && !validateURL(sourceUrl)) {
 		errorMessage = 'Enter a valid URL';
+		disableSubmit = true;
+	} else if (sourceType == 'local' && localPath && !localPath.startsWith('/')) {
+		errorMessage = 'Enter an absolute container file path';
 		disableSubmit = true;
 	} else {
 		errorMessage = '';
@@ -160,7 +260,14 @@
 			</div>
 		{/if}
 		<div class="mt-0 space-y-2">
-			<div class="w-full max-w-xs form-control">
+			<div class="tabs tabs-boxed">
+				<button type="button" class:tab-active={sourceType == 'file'} class="tab" on:click={() => { sourceType = 'file'; hideLocalPathSuggestions(); }}>Upload</button>
+				<button type="button" class:tab-active={sourceType == 'url'} class="tab" on:click={() => { sourceType = 'url'; hideLocalPathSuggestions(); }}>URL</button>
+				<button type="button" class:tab-active={sourceType == 'local'} class="tab" on:click={() => { sourceType = 'local'; browseLocalPath(); }}>Container path</button>
+			</div>
+
+			{#if sourceType == 'file'}
+			<div class="relative w-full max-w-xs form-control">
 				<label for="file" class="label">
 					<span class="label-text">Pick a file</span>
 				</label>
@@ -171,10 +278,12 @@
 					class="w-full max-w-xs file-input file-input-sm file-input-bordered file-input-primary"
 				/>
 			</div>
+			{/if}
 
+			{#if sourceType == 'url'}
 			<div class="w-full max-w-xs form-control">
 				<label for="sourceUrl" class="label">
-					<span class="label-text">Or any video URL</span>
+					<span class="label-text">Video URL</span>
 				</label>
 				<input
 					name="sourceUrl"
@@ -184,6 +293,49 @@
 					class="w-full max-w-xs input input-sm input-bordered input-primary"
 				/>
 			</div>
+			{/if}
+
+			{#if sourceType == 'local'}
+			<div class="w-full max-w-xs form-control">
+				<label for="localPath" class="label">
+					<span class="label-text">Container file path</span>
+				</label>
+				<div class="relative w-full max-w-xs">
+					<input
+						name="localPath"
+						bind:value={localPath}
+						type="text"
+						placeholder="/media/show/episode.mkv"
+						class="w-full max-w-xs input input-sm input-bordered input-primary"
+						on:input={scheduleLocalPathBrowse}
+						on:focus={browseLocalPath}
+						on:keydown={handleLocalPathKeydown}
+					/>
+					{#if localPathSuggestionsVisible && (localPathLoading || localPathError || localPathEntries.length > 0)}
+						<div class="absolute left-0 right-0 top-full z-50 mt-1 max-h-56 overflow-auto rounded border border-base-300 bg-base-100 shadow-xl">
+						{#if localPathLoading}
+							<div class="flex items-center gap-2 px-3 py-2 text-sm opacity-70">
+								<span class="loading loading-spinner loading-sm" />
+								<span>Loading...</span>
+							</div>
+						{:else if localPathError}
+							<p class="px-3 py-2 text-sm text-error">{localPathError}</p>
+						{:else}
+						{#each localPathEntries as entry}
+							<button type="button" class="flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-base-200" on:click={() => selectLocalPath(entry)}>
+								<span>{entry.isDir ? '📁' : '📄'} {entry.name}</span>
+								{#if !entry.isDir}<span class="text-xs opacity-60">{entry.size} B</span>{/if}
+							</button>
+						{/each}
+						{/if}
+						</div>
+					{/if}
+				</div>
+				<p class="text-xs opacity-70">
+					Path must be readable inside the Whishper container.
+				</p>
+			</div>
+			{/if}
 		</div>
 
 		<div class="mb-0 divider" />

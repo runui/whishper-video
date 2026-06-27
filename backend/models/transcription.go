@@ -20,9 +20,18 @@ type Transcription struct {
 	LocalPath      string             `bson:"localPath" json:"localPath"`
 	SourceUrl      string             `bson:"sourceUrl" json:"sourceUrl"`
 	SkipWhisper    bool               `bson:"skipWhisper" json:"skipWhisper"`
-	Result         WhisperResult      `bson:"result" json:"result"`
-	Translations   []Translation      `bson:"translations" json:"translations"`
-	SubtitleTracks []SubtitleTrack    `bson:"subtitleTracks" json:"subtitleTracks"`
+	Result            WhisperResult      `bson:"result" json:"result"`
+	Translations      []Translation      `bson:"translations" json:"translations"`
+	SubtitleTracks    []SubtitleTrack    `bson:"subtitleTracks" json:"subtitleTracks"`
+	TranslationError    string              `bson:"translationError" json:"translationError,omitempty"`
+	TranslationProgress *TranslationProgress `bson:"translationProgress" json:"translationProgress,omitempty"`
+}
+
+type TranslationProgress struct {
+	Total          int    `bson:"total" json:"total"`
+	Completed      int    `bson:"completed" json:"completed"`
+	CurrentSegment int    `bson:"currentSegment" json:"currentSegment"`
+	CurrentStatus  string `bson:"currentStatus" json:"currentStatus"`
 }
 
 func libreTranslateLanguage(language string) string {
@@ -83,7 +92,7 @@ func libreTranslateLanguage(language string) string {
 
 func (t *Transcription) Translate(target string) error {
 	for _, translation := range t.Translations {
-		if translation.TargetLanguage == target {
+		if translation.TargetLanguage == target && translation.Engine != "llm" {
 			log.Debug().Msgf("Translation for %v already exists!", target)
 			return fmt.Errorf("translation for %v already exists", target)
 		}
@@ -93,6 +102,7 @@ func (t *Transcription) Translate(target string) error {
 	if err != nil {
 		return err
 	}
+	translation.Engine = "libretranslate"
 	t.Translations = append(t.Translations, translation)
 	return nil
 }

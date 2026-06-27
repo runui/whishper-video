@@ -16,6 +16,19 @@ export const validateURL = function (url) {
     }
 }
 
+export const cancelTranslation = async function (id) {
+    const res = await fetch(`${CLIENT_API_HOST}/api/translate/${id}/cancel`, {
+        method: "POST"
+    });
+
+    if (res.ok) {
+        const updated = await res.json();
+        transcriptions.update((_transcriptions) =>
+            _transcriptions.map(t => t.id === updated.id ? updated : t)
+        );
+    }
+}
+
 export const deleteTranscription = async function (id) {
     const res = await fetch(`${CLIENT_API_HOST}/api/transcriptions/${id}`, {
         method: "DELETE"
@@ -24,6 +37,14 @@ export const deleteTranscription = async function (id) {
     if (res.ok) {
         transcriptions.update((_transcriptions) => _transcriptions.filter(t => t.id !== id));
     }
+}
+
+export const displayTranscriptionName = function (transcription) {
+    const fileName = transcription?.fileName || '';
+    if (fileName.includes('_WHSHPR_')) {
+        return fileName.split('_WHSHPR_').slice(1).join('_WHSHPR_') || fileName;
+    }
+    return fileName || transcription?.id || 'Unknown file';
 }
 
 export const getRandomSentence = function () {
@@ -44,7 +65,37 @@ export const getRandomSentence = function () {
         "Words, don't come easy, but I can help find the way.",
         "You speak, I write. It's no magic, just AI!",
         "Can't understand that language? I can translate!",
-        "I mean every word I say!"
+        "I mean every word I say!",
+        "What are you muttering about over there?",
+        "A whisper in time saves nine subtitles.",
+        "Because every word deserves a second language.",
+        "Breaking the sound barrier, one word at a time.",
+        "Can you hear me now? Good. Let's transcribe.",
+        "Did you just say what I think you said?",
+        "Don't let the silence speak for itself.",
+        "Even mumbles have meaning.",
+        "From babble to babblefish.",
+        "Hearing is believing, transcribing is knowing.",
+        "I caught that. Every. Single. Word.",
+        "I heard you the first time. And the second.",
+        "If a tree falls in a forest, I'll subtitle it.",
+        "Let me translate that for you.",
+        "Making small talk into big data.",
+        "Mum's the word? Not anymore.",
+        "Now with 100% more captions.",
+        "Say what? Say it again, I'm transcribing.",
+        "Silence is golden, but subtitles are platinum.",
+        "Speak easy. I'm listening hard.",
+        "Subtitle me this, Batman.",
+        "The walls have ears. So do we.",
+        "They say every picture tells a story. We prefer audio.",
+        "This is your brain on transcription.",
+        "Turns out, I'm a great listener.",
+        "Wait, let me write that down.",
+        "What did one subtitle say to the other? Same here.",
+        "What's the frequency, Kenneth?",
+        "Words are just sounds waiting to be captioned.",
+        "You had me at 'Hello World'."
     ]
 
     const randomSentence = sentences[Math.floor(Math.random() * sentences.length)];
@@ -52,70 +103,66 @@ export const getRandomSentence = function () {
     return randomSentence;
 }
 
-// Expects a segments array with start, end and text properties
-export const downloadSRT = function (jsonData, title) {
-    let srtContent = '';
-    
-    jsonData.forEach((segment, index) => {
+// Content generation helpers
+export function generateSRT(segments) {
+    let content = '';
+    segments.forEach((segment, index) => {
         let startSeconds = Math.floor(segment.start);
         let startMillis = Math.floor((segment.start - startSeconds) * 1000);
         let start = new Date(startSeconds * 1000 + startMillis).toISOString().substr(11, 12);
         let endSeconds = Math.floor(segment.end);
         let endMillis = Math.floor((segment.end - endSeconds) * 1000);
         let end = new Date(endSeconds * 1000 + endMillis).toISOString().substr(11, 12);
-    
-        srtContent += `${index + 1}\n${start} --> ${end}\n${segment.text}\n\n`;
+        content += `${index + 1}\n${start} --> ${end}\n${segment.text}\n\n`;
     });
-  
-    let srtBlob = new Blob([srtContent], {type: 'text/plain'});
-    let url = URL.createObjectURL(srtBlob);
-    let link = document.createElement('a');
-    link.href = url;
-    link.download = `${title}.srt`;
-    link.click();
+    return content;
 }
 
-// Downloads received text as a TXT file
+export function generateVTT(segments) {
+    let content = 'WEBVTT\n\n';
+    segments.forEach((segment, index) => {
+        let startSeconds = Math.floor(segment.start);
+        let startMillis = Math.floor((segment.start - startSeconds) * 1000);
+        let start = new Date(startSeconds * 1000 + startMillis).toISOString().substr(11, 12);
+        let endSeconds = Math.floor(segment.end);
+        let endMillis = Math.floor((segment.end - endSeconds) * 1000);
+        let end = new Date(endSeconds * 1000 + endMillis).toISOString().substr(11, 12);
+        content += `${index + 1}\n${start} --> ${end}\n${segment.text}\n\n`;
+    });
+    return content;
+}
+
+export function generateTXT(text) {
+    return text;
+}
+
+export function generateJSON(jsonData) {
+    return JSON.stringify(jsonData);
+}
+
+function triggerDownload(content, filename, mimeType) {
+    let blob = new Blob([content], {type: mimeType});
+    let url = URL.createObjectURL(blob);
+    let link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+}
+
+export const downloadSRT = function (segments, title) {
+    triggerDownload(generateSRT(segments), `${title}.srt`, 'text/plain');
+}
+
 export const downloadTXT = function (text, title) {
-    let srtBlob = new Blob([text], {type: 'text/plain'});
-    let url = URL.createObjectURL(srtBlob);
-    let link = document.createElement('a');
-    link.href = url;
-    link.download = `${title}.txt`;
-    link.click();
+    triggerDownload(text, `${title}.txt`, 'text/plain');
 }
 
-// Downloads received JSON data as a JSON file
 export const downloadJSON = function (jsonData, title) {
-    let srtBlob = new Blob([JSON.stringify(jsonData)], {type: 'text/plain'});
-    let url = URL.createObjectURL(srtBlob);
-    let link = document.createElement('a');
-    link.href = url;
-    link.download = `${title}.json`;
-    link.click();
+    triggerDownload(generateJSON(jsonData), `${title}.json`, 'text/plain');
 }
 
-// Expects a segments array with start, end and text properties
-export const downloadVTT = function (jsonData, title) {
-    let vttContent = 'WEBVTT\n\n'; // VTT files start with "WEBVTT" line
-  
-    jsonData.forEach((segment, index) => {
-      let startSeconds = Math.floor(segment.start);
-      let startMillis = Math.floor((segment.start - startSeconds) * 1000);
-      let start = new Date(startSeconds * 1000 + startMillis).toISOString().substr(11, 12);
-  
-      let endSeconds = Math.floor(segment.end);
-      let endMillis = Math.floor((segment.end - endSeconds) * 1000);
-      let end = new Date(endSeconds * 1000 + endMillis).toISOString().substr(11, 12);
-  
-      vttContent += `${index + 1}\n${start} --> ${end}\n${segment.text}\n\n`;
-    });
-  
-    let vttBlob = new Blob([vttContent], {type: 'text/plain'});
-    let url = URL.createObjectURL(vttBlob);
-    let link = document.createElement('a');
-    link.href = url;
-    link.download = `${title}.vtt`;
-    link.click();
+export const downloadVTT = function (segments, title) {
+    triggerDownload(generateVTT(segments), `${title}.vtt`, 'text/plain');
 }
   

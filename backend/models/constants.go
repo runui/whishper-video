@@ -6,6 +6,7 @@ const (
 	TranscriptionStatusDone         = 2
 	TrannscriptionStatusTranslating = 3
 	TranscriptionStatusError        = -1
+	TranscriptionStatusTranslationError = -2
 
 	SourceTypeFile = "file"
 	SourceTypeURL  = "url"

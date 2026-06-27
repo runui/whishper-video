@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/goccy/go-json"
@@ -19,6 +21,13 @@ type embyWebhookPayload struct {
 	Item  struct {
 		Path string `json:"Path"`
 	} `json:"Item"`
+}
+
+type localFileEntry struct {
+	Name  string `json:"name"`
+	Path  string `json:"path"`
+	IsDir bool   `json:"isDir"`
+	Size  int64  `json:"size"`
 }
 
 func (s *Server) handleGetAllTranscriptions(c *fiber.Ctx) error {
@@ -58,6 +67,49 @@ func (s *Server) handleGetTranscriptionById(c *fiber.Ctx) error {
 	return nil
 }
 
+func (s *Server) handleListLocalFiles(c *fiber.Ctx) error {
+	path := c.Query("path", "/")
+	if !filepath.IsAbs(path) {
+		return fiber.NewError(fiber.StatusBadRequest, "path must be absolute")
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return fiber.NewError(fiber.StatusNotFound, "path not found")
+	}
+	if !info.IsDir() {
+		path = filepath.Dir(path)
+	}
+
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return fiber.NewError(fiber.StatusForbidden, "path cannot be read")
+	}
+
+	result := make([]localFileEntry, 0, len(entries))
+	for _, entry := range entries {
+		entryInfo, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		entryPath := filepath.Join(path, entry.Name())
+		if entry.IsDir() {
+			entryPath += string(os.PathSeparator)
+		}
+		result = append(result, localFileEntry{
+			Name:  entry.Name(),
+			Path:  entryPath,
+			IsDir: entry.IsDir(),
+			Size:  entryInfo.Size(),
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"path":    path,
+		"entries": result,
+	})
+}
+
 // This function receives data from a form to create a new transcription.
 // If the transcription is created successfully, it returns a 201 Created status code and
 // broadcasts the new transcription to all ws clients.
@@ -65,9 +117,14 @@ func (s *Server) handlePostTranscription(c *fiber.Ctx) error {
 	log.Debug().Msg("POST /api/transcriptions")
 	var transcription models.Transcription
 
-	// we get the filename from the from
+	localPath := c.FormValue("localPath")
+	sourceUrl := c.FormValue("sourceUrl")
+
+	// we get the filename from the form
 	var filename string
-	if c.FormValue("sourceUrl") == "" {
+	if localPath != "" {
+		filename = filepath.Base(localPath)
+	} else if sourceUrl == "" {
 		// Get the form file from the request.
 		file, err := c.FormFile("file")
 		if err != nil {
@@ -93,9 +150,10 @@ func (s *Server) handlePostTranscription(c *fiber.Ctx) error {
 	transcription.Language = c.FormValue("language")
 	transcription.ModelSize = c.FormValue("modelSize")
 	transcription.FileName = filename
+	transcription.LocalPath = localPath
 	transcription.Status = models.TranscriptionStatusPending
 	transcription.Task = "transcribe"
-	transcription.SourceUrl = c.FormValue("sourceUrl")
+	transcription.SourceUrl = sourceUrl
 	transcription.SkipWhisper = c.FormValue("skipWhisper") == "true"
 	transcription.Device = c.FormValue("device")
 	if transcription.Device != "cpu" && transcription.Device != "cuda" {
@@ -263,6 +321,9 @@ func (s *Server) handlePatchTranscription(c *fiber.Ctx) error {
 func (s *Server) handleTranslate(c *fiber.Ctx) error {
 	id := c.Params("id")
 	targetLang := c.Params("target")
+	start := time.Now()
+
+	log.Info().Str("id", id).Str("targetLang", targetLang).Msg("Starting LibreTranslate translation")
 
 	transcription := s.Db.GetTranscription(id)
 
@@ -273,8 +334,9 @@ func (s *Server) handleTranslate(c *fiber.Ctx) error {
 
 	err := transcription.Translate(targetLang)
 	if err != nil {
-		log.Debug().Err(err).Msg("Error with translation")
-		transcription.Status = models.TranscriptionStatusDone
+		log.Error().Err(err).Str("id", id).Dur("duration", time.Since(start)).Msg("LibreTranslate translation failed")
+		transcription.Status = models.TranscriptionStatusTranslationError
+		transcription.TranslationError = err.Error()
 		s.Db.UpdateTranscription(transcription)
 		s.BroadcastTranscription(transcription)
 		return err
@@ -284,6 +346,8 @@ func (s *Server) handleTranslate(c *fiber.Ctx) error {
 	transcription.Status = models.TranscriptionStatusDone
 	s.Db.UpdateTranscription(transcription)
 	s.BroadcastTranscription(transcription)
+
+	log.Info().Str("id", id).Str("targetLang", targetLang).Dur("duration", time.Since(start)).Msg("LibreTranslate translation completed")
 	return nil
 }
 
@@ -291,20 +355,24 @@ func (s *Server) handleTranslateSubtitleTrack(c *fiber.Ctx) error {
 	id := c.Params("id")
 	trackID := c.Params("track")
 	targetLang := c.Params("target")
+	start := time.Now()
+
+	log.Info().Str("id", id).Str("track", trackID).Str("targetLang", targetLang).Msg("Starting LibreTranslate subtitle track translation")
 
 	transcription := s.Db.GetTranscription(id)
 	if transcription == nil {
 		return fiber.NewError(fiber.StatusNotFound, "Not found")
 	}
 
-	trackIndex, ok := utils.FindSubtitleTrack(transcription.SubtitleTracks, trackID)
+	trackIndex, ok := findLLMSubtitleTrack(transcription.SubtitleTracks, trackID)
 	if !ok {
 		return fiber.NewError(fiber.StatusNotFound, "Subtitle track not found")
 	}
 
 	track := &transcription.SubtitleTracks[trackIndex]
 	for _, translation := range track.Translations {
-		if translation.TargetLanguage == targetLang {
+		if translation.TargetLanguage == targetLang && translation.Engine != "llm" {
+			log.Warn().Str("id", id).Str("targetLang", targetLang).Msg("Translation already exists")
 			return fiber.NewError(fiber.StatusBadRequest, "translation already exists")
 		}
 	}
@@ -315,13 +383,15 @@ func (s *Server) handleTranslateSubtitleTrack(c *fiber.Ctx) error {
 
 	translation, err := models.TranslateWhisperResult(track.Result, track.Language, targetLang)
 	if err != nil {
-		log.Debug().Err(err).Msg("Error translating subtitle track")
-		transcription.Status = models.TranscriptionStatusDone
+		log.Error().Err(err).Str("id", id).Str("track", trackID).Dur("duration", time.Since(start)).Msg("LibreTranslate subtitle track translation failed")
+		transcription.Status = models.TranscriptionStatusTranslationError
+		transcription.TranslationError = err.Error()
 		s.Db.UpdateTranscription(transcription)
 		s.BroadcastTranscription(transcription)
 		return err
 	}
 
+	translation.Engine = "libretranslate"
 	track.Translations = append(track.Translations, translation)
 	transcription.Status = models.TranscriptionStatusDone
 	ut, err := s.Db.UpdateTranscription(transcription)
@@ -329,7 +399,317 @@ func (s *Server) handleTranslateSubtitleTrack(c *fiber.Ctx) error {
 		return err
 	}
 	s.BroadcastTranscription(ut)
+	log.Info().Str("id", id).Str("track", trackID).Str("targetLang", targetLang).Dur("duration", time.Since(start)).Msg("LibreTranslate subtitle track translation completed")
 	return nil
+}
+
+func (s *Server) handleLLMTranslateSubtitleTrack(c *fiber.Ctx) error {
+	id := c.Params("id")
+	trackID := c.Params("track")
+	start := time.Now()
+
+	var req models.LLMTranslationRequest
+	if len(c.Body()) > 0 {
+		if err := json.Unmarshal(c.Body(), &req); err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "Bad request")
+		}
+	}
+	if req.TargetLanguage == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "targetLanguage is required")
+	}
+
+	log.Info().Str("id", id).Str("track", trackID).Str("targetLang", req.TargetLanguage).Str("model", req.Model).Msg("Starting LLM subtitle track translation")
+
+	transcription := s.Db.GetTranscription(id)
+	if transcription == nil {
+		return fiber.NewError(fiber.StatusNotFound, "Not found")
+	}
+
+	trackIndex, ok := findLLMSubtitleTrack(transcription.SubtitleTracks, trackID)
+	if !ok {
+		log.Error().Str("id", id).Str("track", trackID).Msg("Subtitle track not found for LLM translation")
+		return fiber.NewError(fiber.StatusNotFound, "Subtitle track not found")
+	}
+
+	track := &transcription.SubtitleTracks[trackIndex]
+	for _, translation := range track.Translations {
+		if translation.TargetLanguage == req.TargetLanguage && translation.Engine == "llm" {
+			log.Warn().Str("id", id).Str("targetLang", req.TargetLanguage).Msg("LLM translation already exists")
+			return fiber.NewError(fiber.StatusBadRequest, "translation already exists")
+		}
+	}
+
+	s.enrichLLMContext(transcription, &req)
+
+	transcription.TranslationError = ""
+	transcription.Status = models.TrannscriptionStatusTranslating
+	s.Db.UpdateTranscription(transcription)
+	s.BroadcastTranscription(transcription)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	models.RegisterTranslationCancel(id, cancel)
+
+	var lastProgressUpdate time.Time
+	onProgress := func(total, completed, currentSegment int, status string) {
+		transcription.TranslationProgress = &models.TranslationProgress{
+			Total: total, Completed: completed, CurrentSegment: currentSegment, CurrentStatus: status,
+		}
+		now := time.Now()
+		if now.Sub(lastProgressUpdate) > time.Second || completed >= total {
+			s.BroadcastTranscription(transcription)
+			lastProgressUpdate = now
+		}
+	}
+
+	go func() {
+		defer models.UnregisterTranslationCancel(id)
+		defer cancel()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error().Str("id", id).Interface("panic", r).Msg("LLM subtitle track translation panicked")
+				transcription.Status = models.TranscriptionStatusTranslationError
+				transcription.TranslationError = fmt.Sprintf("internal error: %v", r)
+				transcription.TranslationProgress = nil
+				s.Db.UpdateTranscription(transcription)
+				s.BroadcastTranscription(transcription)
+			}
+		}()
+
+		translation, err := models.TranslateWhisperResultWithLLM(ctx, track.Result, track.Language, req, onProgress)
+		transcription.TranslationProgress = nil
+		if err != nil {
+			log.Error().Err(err).Str("id", id).Str("track", trackID).Str("targetLang", req.TargetLanguage).Dur("duration", time.Since(start)).Msg("LLM subtitle track translation failed")
+			transcription.Status = models.TranscriptionStatusTranslationError
+			transcription.TranslationError = err.Error()
+			s.Db.UpdateTranscription(transcription)
+			s.BroadcastTranscription(transcription)
+			return
+		}
+
+		track.Translations = append(track.Translations, translation)
+		transcription.Status = models.TranscriptionStatusDone
+		ut, err := s.Db.UpdateTranscription(transcription)
+		if err != nil {
+			log.Error().Err(err).Str("id", id).Msg("Failed to update transcription after translation")
+			return
+		}
+		s.BroadcastTranscription(ut)
+		log.Info().Str("id", id).Str("track", trackID).Str("targetLang", req.TargetLanguage).Dur("duration", time.Since(start)).Msg("LLM subtitle track translation completed")
+	}()
+
+	return c.JSON(transcription)
+}
+
+func (s *Server) handleLLMTranslate(c *fiber.Ctx) error {
+	id := c.Params("id")
+	start := time.Now()
+
+	var req models.LLMTranslationRequest
+	if len(c.Body()) > 0 {
+		if err := json.Unmarshal(c.Body(), &req); err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, "Bad request")
+		}
+	}
+	if req.TargetLanguage == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "targetLanguage is required")
+	}
+
+	log.Info().Str("id", id).Str("targetLang", req.TargetLanguage).Str("model", req.Model).Msg("Starting LLM translation")
+
+	transcription := s.Db.GetTranscription(id)
+	if transcription == nil {
+		return fiber.NewError(fiber.StatusNotFound, "Not found")
+	}
+	if len(transcription.Result.Segments) == 0 {
+		log.Error().Str("id", id).Msg("Transcription has no segments for LLM translation")
+		transcription.Status = models.TranscriptionStatusError
+		s.Db.UpdateTranscription(transcription)
+		s.BroadcastTranscription(transcription)
+		return fiber.NewError(fiber.StatusBadRequest, "transcription has no segments")
+	}
+	for _, translation := range transcription.Translations {
+		if translation.TargetLanguage == req.TargetLanguage && translation.Engine == "llm" {
+			log.Warn().Str("id", id).Str("targetLang", req.TargetLanguage).Msg("LLM translation already exists")
+			return fiber.NewError(fiber.StatusBadRequest, "translation already exists")
+		}
+	}
+
+	s.enrichLLMContext(transcription, &req)
+
+	transcription.TranslationError = ""
+	transcription.Status = models.TrannscriptionStatusTranslating
+	s.Db.UpdateTranscription(transcription)
+	s.BroadcastTranscription(transcription)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	models.RegisterTranslationCancel(id, cancel)
+
+	var lastProgressUpdate time.Time
+	onProgress := func(total, completed, currentSegment int, status string) {
+		transcription.TranslationProgress = &models.TranslationProgress{
+			Total: total, Completed: completed, CurrentSegment: currentSegment, CurrentStatus: status,
+		}
+		now := time.Now()
+		if now.Sub(lastProgressUpdate) > time.Second || completed >= total {
+			s.BroadcastTranscription(transcription)
+			lastProgressUpdate = now
+		}
+	}
+
+	go func() {
+		defer models.UnregisterTranslationCancel(id)
+		defer cancel()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error().Str("id", id).Interface("panic", r).Msg("LLM translation panicked")
+				transcription.Status = models.TranscriptionStatusTranslationError
+				transcription.TranslationError = fmt.Sprintf("internal error: %v", r)
+				transcription.TranslationProgress = nil
+				s.Db.UpdateTranscription(transcription)
+				s.BroadcastTranscription(transcription)
+			}
+		}()
+
+		translation, err := models.TranslateWhisperResultWithLLM(ctx, transcription.Result, transcription.Language, req, onProgress)
+		transcription.TranslationProgress = nil
+		if err != nil {
+			log.Error().Err(err).Str("id", id).Str("targetLang", req.TargetLanguage).Dur("duration", time.Since(start)).Msg("LLM translation failed")
+			transcription.Status = models.TranscriptionStatusTranslationError
+			transcription.TranslationError = err.Error()
+			s.Db.UpdateTranscription(transcription)
+			s.BroadcastTranscription(transcription)
+			return
+		}
+
+		transcription.Translations = append(transcription.Translations, translation)
+		transcription.Status = models.TranscriptionStatusDone
+		ut, err := s.Db.UpdateTranscription(transcription)
+		if err != nil {
+			log.Error().Err(err).Str("id", id).Msg("Failed to update transcription after translation")
+			return
+		}
+		s.BroadcastTranscription(ut)
+		log.Info().Str("id", id).Str("targetLang", req.TargetLanguage).Int("segments", len(translation.Result.Segments)).Dur("duration", time.Since(start)).Msg("LLM translation completed")
+	}()
+
+	return c.JSON(transcription)
+}
+
+func (s *Server) enrichLLMContext(transcription *models.Transcription, req *models.LLMTranslationRequest) {
+	if transcription.LocalPath == "" {
+		return
+	}
+
+	nfoContext := models.LoadNFOContext(transcription.LocalPath)
+	if nfoContext != "" {
+		req.AutoContext = nfoContext
+		log.Info().Str("id", transcription.ID.Hex()).Str("localPath", transcription.LocalPath).Msg("Loaded NFO context for LLM translation")
+	}
+
+	mediaDir := filepath.Dir(transcription.LocalPath)
+	allTranscriptions := s.Db.GetAllTranscriptions()
+	var referencePairs []string
+	for _, t := range allTranscriptions {
+		if t.ID == transcription.ID {
+			continue
+		}
+		if t.LocalPath == "" {
+			continue
+		}
+		if filepath.Dir(t.LocalPath) != mediaDir {
+			continue
+		}
+		for _, tr := range t.Translations {
+			if tr.TargetLanguage == req.TargetLanguage && len(tr.Result.Segments) > 0 {
+				maxRefs := 5
+				count := 0
+				for _, seg := range tr.Result.Segments {
+					if seg.Text == "" {
+						continue
+					}
+					var sourceText string
+					for _, ts := range t.Result.Segments {
+						if ts.ID == seg.ID || (ts.Start == seg.Start && ts.End == seg.End) {
+							sourceText = ts.Text
+							break
+						}
+					}
+					if sourceText == "" {
+						continue
+					}
+					referencePairs = append(referencePairs, fmt.Sprintf("Source: %s\nTarget: %s", sourceText, seg.Text))
+					count++
+					if count >= maxRefs {
+						break
+					}
+				}
+				if len(referencePairs) >= 10 {
+					break
+				}
+			}
+		}
+		if len(referencePairs) >= 10 {
+			break
+		}
+	}
+	if len(referencePairs) > 0 {
+		req.ReferenceExamples = "Reference translations from related episodes:\n" + strings.Join(referencePairs, "\n\n")
+		log.Info().Str("id", transcription.ID.Hex()).Int("examples", len(referencePairs)).Msg("Loaded reference translations for LLM translation")
+	}
+}
+
+func (s *Server) handleCancelTranslation(c *fiber.Ctx) error {
+	id := c.Params("id")
+
+	log.Info().Str("id", id).Msg("Translation cancellation requested")
+
+	transcription := s.Db.GetTranscription(id)
+	if transcription == nil {
+		return fiber.NewError(fiber.StatusNotFound, "Not found")
+	}
+
+	if transcription.Status != models.TrannscriptionStatusTranslating && 
+	   transcription.Status != models.TranscriptionStatusTranslationError &&
+	   transcription.Status != models.TranscriptionStatusError {
+		log.Warn().Str("id", id).Int("status", transcription.Status).Msg("Translation not in cancellable state")
+		return fiber.NewError(fiber.StatusBadRequest, "translation is not in a cancellable state")
+	}
+
+	models.CancelTranslation(id)
+
+	transcription.Status = models.TranscriptionStatusDone
+	transcription.TranslationError = ""
+	transcription.TranslationProgress = nil
+	ut, err := s.Db.UpdateTranscription(transcription)
+	if err != nil {
+		return err
+	}
+	s.BroadcastTranscription(ut)
+	return c.JSON(ut)
+}
+
+func findLLMSubtitleTrack(tracks []models.SubtitleTrack, trackID string) (int, bool) {
+	if trackID != "auto" {
+		return utils.FindSubtitleTrack(tracks, trackID)
+	}
+
+	for i, track := range tracks {
+		language := strings.ToLower(track.Language)
+		title := strings.ToLower(track.Title)
+		if (language == "en" || language == "eng") && !strings.Contains(title, "sdh") && !strings.Contains(title, "cc") {
+			return i, true
+		}
+	}
+	for i, track := range tracks {
+		language := strings.ToLower(track.Language)
+		if language == "en" || language == "eng" {
+			return i, true
+		}
+	}
+	if len(tracks) > 0 {
+		return 0, true
+	}
+	return 0, false
 }
 
 func (s *Server) handleExtractSubtitleTracks(c *fiber.Ctx) error {
@@ -370,4 +750,49 @@ func (s *Server) handleExtractSubtitleTracks(c *fiber.Ctx) error {
 	}
 	s.BroadcastTranscription(ut)
 	return c.JSON(ut)
+}
+
+type writeSubtitleRequest struct {
+	Format    string `json:"format"`
+	Content   string `json:"content"`
+	Overwrite bool   `json:"overwrite"`
+}
+
+func (s *Server) handleWriteSubtitle(c *fiber.Ctx) error {
+	id := c.Params("id")
+
+	var req writeSubtitleRequest
+	if err := json.Unmarshal(c.Body(), &req); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid request")
+	}
+
+	ext := map[string]string{"srt": ".srt", "vtt": ".vtt", "txt": ".txt", "json": ".json"}[req.Format]
+	if ext == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid format")
+	}
+
+	transcription := s.Db.GetTranscription(id)
+	if transcription == nil {
+		return fiber.NewError(fiber.StatusNotFound, "not found")
+	}
+	if transcription.LocalPath == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "no local file path")
+	}
+
+	baseName := strings.TrimSuffix(transcription.LocalPath, filepath.Ext(transcription.LocalPath))
+	outputPath := baseName + ext
+
+	if _, err := os.Stat(outputPath); err == nil && !req.Overwrite {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error": "file already exists",
+			"path":  outputPath,
+		})
+	}
+
+	if err := os.WriteFile(outputPath, []byte(req.Content), 0644); err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "failed to write file: "+err.Error())
+	}
+
+	log.Info().Str("id", id).Str("path", outputPath).Str("format", req.Format).Msg("Subtitle file written to local path")
+	return c.JSON(fiber.Map{"path": outputPath})
 }

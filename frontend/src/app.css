@@ -1,3 +1,15 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+.base {
+    max-width: min(90vw, 500px) !important;
+    overflow-wrap: break-word !important;
+    word-break: break-word !important;
+}
+
+.message {
+    min-width: 0 !important;
+    overflow-wrap: break-word !important;
+    word-break: break-word !important;
+}

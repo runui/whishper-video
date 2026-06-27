@@ -16,6 +16,7 @@
   - Upload a file to transcribe.
 - [x] 📥 **Download transcriptions in many formats**: TXT, JSON, VTT, SRT or copy the raw text to your clipboard.
 - [x] 🌐 **Translate your transcriptions** to any language supported by [Libretranslate](https://libretranslate.com).
+- [x] 🤖 **Translate subtitle tracks with an OpenAI-compatible LLM** for context-aware subtitle localization.
 - [x] ✍️ **Powerful subtitle editor** so you don't need to leave the UI!
   - Transcription highlighting based on media position.
   - CPS (Characters per second) warnings.
@@ -57,6 +58,20 @@ Contributions are welcome! Feel free to open a PR with your changes, or take a l
 ### Development setup
 
 Check out the development documentation [here](https://whishper-docs.pages.dev/guides/develop/).
+
+### LLM subtitle translation
+
+Whishper can translate extracted subtitle tracks through an OpenAI-compatible chat completions API. Configure the backend with:
+
+```env
+LLM_TRANSLATION_ENDPOINT=http://ollama:11434/v1/chat/completions
+LLM_TRANSLATION_MODEL=qwen2.5:14b
+LLM_TRANSLATION_API_KEY=
+LLM_TRANSLATION_TIMEOUT_SECONDS=120
+LLM_TRANSLATION_CHUNK_SIZE=60
+```
+
+In the translation dialog, choose a subtitle track as the source, select `LLM` as the translation engine, enter a target language such as `zh-CN`, and optionally provide context or terminology. The translated subtitles are saved as a normal subtitle-track translation, so they can be edited and downloaded from the existing UI.
 
 ## Screenshots
 

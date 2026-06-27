@@ -10,6 +10,7 @@
 	import SuccessTranscription from '$lib/components/SuccessTranscription.svelte';
 	import PendingTranscription from '$lib/components/PendingTranscription.svelte';
 	import PendingTranslation from '$lib/components/PendingTranslation.svelte';
+	import FailedTranslation from '$lib/components/FailedTranslation.svelte';
 	import ErrorTranscription from '$lib/components/ErrorTranscription.svelte';
 
 	//export let data;
@@ -46,17 +47,14 @@
 
 		socket.onmessage = (event) => {
             let update = JSON.parse(event.data);
-            // use update to update the store
-            transcriptions.update(transcriptions => {
-                let index = transcriptions.findIndex(tr => tr.id === update.id);
+            transcriptions.update(prev => {
+                let index = prev.findIndex(tr => tr.id === update.id);
                 if (index >= 0) {
-                    // replace the item at index
-                    transcriptions[index] = update;
-                } else {
-                    // add the new item
-                    transcriptions.push(update);
+                    let next = [...prev];
+                    next[index] = update;
+                    return next;
                 }
-                return transcriptions; // return a new object to trigger reactivity
+                return [...prev, update];
             });
         };
 	}
@@ -93,7 +91,7 @@
 		<span>
 			<img class="w-20 h-20" src="/logo.svg" alt="Logo: a cloud whispering" />
 		</span>
-		<span> Whishper </span>
+		<span> Whishper Bird</span>
 	</h1>
 	<h2 class="font-mono text-center text-md opacity-70">{data.randomSentence}</h2>
 </header>
@@ -122,7 +120,10 @@
 				{#if tr.status == 3}
 					<PendingTranslation {tr} />
 				{/if}
-				{#if tr.status < 0}
+				{#if tr.status == -2}
+					<FailedTranslation {tr} on:translate={handleTranslate} />
+				{/if}
+				{#if tr.status == -1}
 					<ErrorTranscription {tr} />
 				{/if}
 			{/each}

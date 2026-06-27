@@ -2,6 +2,7 @@ package api
 
 import (
 	"os"
+	"sync"
 
 	"github.com/goccy/go-json"
 	"github.com/gofiber/contrib/websocket"
@@ -19,6 +20,7 @@ type Server struct {
 	Db                 database.Db
 	NewTranscriptionCh chan bool
 	clients            []*websocket.Conn
+	broadcastMu        sync.Mutex
 }
 
 func NewServer(listenAddr string, db database.Db) *Server {
@@ -67,7 +69,9 @@ func (s *Server) SetupWebsocket() {
 }
 
 func (s *Server) BroadcastTranscription(t *models.Transcription) {
-	// Convert the transcription to JSON.
+	s.broadcastMu.Lock()
+	defer s.broadcastMu.Unlock()
+
 	json, err := json.Marshal(&t)
 	if err != nil {
 		log.Error().Err(err).Msg("Error marshalling transcription to JSON:")
@@ -120,12 +124,39 @@ func (s *Server) RegisterRoutes() {
 		return err
 	})
 
+	s.Router.Get("/api/files", func(c *fiber.Ctx) error {
+		log.Debug().Msgf("GET /api/files?path=%v", c.Query("path"))
+		err := s.handleListLocalFiles(c)
+		if err != nil {
+			log.Error().Err(err).Msg("Error handling GET /api/files")
+		}
+		return err
+	})
+
 	// Register HTTP route for getting initial state.
 	s.Router.Get("/api/translate/:id/:target", func(c *fiber.Ctx) error {
 		log.Debug().Msgf("GET /api/translate/%v/%v", c.Params("id"), c.Params("target"))
 		err := s.handleTranslate(c)
 		if err != nil {
 			log.Error().Err(err).Msg("Error handling GET /api/translate/:id/:source")
+		}
+		return err
+	})
+
+	s.Router.Post("/api/translate/:id/cancel", func(c *fiber.Ctx) error {
+		log.Debug().Msgf("POST /api/translate/%v/cancel", c.Params("id"))
+		err := s.handleCancelTranslation(c)
+		if err != nil {
+			log.Error().Err(err).Msg("Error handling POST /api/translate/:id/cancel")
+		}
+		return err
+	})
+
+	s.Router.Post("/api/translate/:id/llm", func(c *fiber.Ctx) error {
+		log.Debug().Msgf("POST /api/translate/%v/llm", c.Params("id"))
+		err := s.handleLLMTranslate(c)
+		if err != nil {
+			log.Error().Err(err).Msg("Error handling POST /api/translate/:id/llm")
 		}
 		return err
 	})
@@ -139,11 +170,29 @@ func (s *Server) RegisterRoutes() {
 		return err
 	})
 
+	s.Router.Post("/api/subtitles/:id/:track/llm-translate", func(c *fiber.Ctx) error {
+		log.Debug().Msgf("POST /api/subtitles/%v/%v/llm-translate", c.Params("id"), c.Params("track"))
+		err := s.handleLLMTranslateSubtitleTrack(c)
+		if err != nil {
+			log.Error().Err(err).Msg("Error handling POST /api/subtitles/:id/:track/llm-translate")
+		}
+		return err
+	})
+
 	s.Router.Post("/api/subtitles/:id/extract", func(c *fiber.Ctx) error {
 		log.Debug().Msgf("POST /api/subtitles/%v/extract", c.Params("id"))
 		err := s.handleExtractSubtitleTracks(c)
 		if err != nil {
 			log.Error().Err(err).Msg("Error handling POST /api/subtitles/:id/extract")
+		}
+		return err
+	})
+
+	s.Router.Post("/api/subtitles/:id/write", func(c *fiber.Ctx) error {
+		log.Debug().Msgf("POST /api/subtitles/%v/write", c.Params("id"))
+		err := s.handleWriteSubtitle(c)
+		if err != nil {
+			log.Error().Err(err).Msg("Error handling POST /api/subtitles/:id/write")
 		}
 		return err
 	})

@@ -195,9 +195,15 @@
 </script>
 
 {#if $currentTranscription.status != 2}
-	<div class="flex items-center justify-center">
+	<div class="flex flex-col items-center justify-center gap-2">
 		<span class="loading loading-spinner loading-lg"></span>
 		<p class="text-center">Waiting for task to finish {$currentTranscription.status == 3 ? "translating" : "transcribing"}...</p>
+		{#if $currentTranscription.status == 3 && $currentTranscription.translationProgress}
+			{@const p = $currentTranscription.translationProgress}
+			{#key `${p.completed}/${p.total}|${p.currentSegment}|${p.currentStatus}`}
+				<p class="flip-text font-mono text-sm opacity-70">{p.completed}/{p.total}  ·  seg #{p.currentSegment} {p.currentStatus}</p>
+			{/key}
+		{/if}
 	</div>
 {:else}
 <div class="flex flex-col items-center break-words">
@@ -259,7 +265,7 @@
 					on:change={(event) => selectSubtitleTrack(event.target.value)}
 				>
 					{#each $currentTranscription.subtitleTracks as track}
-						<option value={track.id}>{getTrackLabel(track)}</option>
+						<option value={track.id}>✅ {getTrackLabel(track)}</option>
 					{/each}
 				</select>
 			</div>
@@ -277,11 +283,33 @@
 			>
 				<option value="original">✅ {$currentTranscription.result.language}</option>
 				{#each $currentTranscription.translations as translation}
-					<option value={translation.targetLanguage}>🤖 {translation.targetLanguage}</option>
+					<option value={translation.targetLanguage}>{translation.engine === 'llm' ? '🧠' : '🤖'} {translation.targetLanguage}</option>
 				{/each}
 			</select>
-		</div>
-	{/if}
+	</div>
+{/if}
+
+<style>
+	.flip-text {
+		margin: 0;
+		white-space: nowrap;
+		animation: flipIn 0.8s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+		transform-origin: center bottom;
+	}
+	@keyframes flipIn {
+		0% {
+			transform: rotateX(-90deg) translateY(50%);
+			opacity: 0;
+		}
+		40% {
+			opacity: 0.4;
+		}
+		100% {
+			transform: rotateX(0) translateY(0);
+			opacity: 1;
+		}
+	}
+</style>
 </div>
 <div class="mt-4">
 	<!-- Editor configuration -->
