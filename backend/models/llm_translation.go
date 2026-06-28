@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -44,6 +45,8 @@ type llmTranslator struct {
 	httpClient *http.Client
 	useTools   bool
 	toolsTried bool
+	maxRetries int
+	debugIO    bool
 }
 
 func newLLMTranslator(modelOverride string) (*llmTranslator, error) {
@@ -64,6 +67,11 @@ func newLLMTranslator(modelOverride string) (*llmTranslator, error) {
 	timeout := time.Duration(timeoutSeconds) * time.Second
 
 	useTools := strings.TrimSpace(os.Getenv("LLM_TRANSLATION_NO_TOOLS")) != "true"
+	maxRetries := envInt("LLM_TRANSLATION_MAX_RETRIES", 5)
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+	debugIO := strings.TrimSpace(os.Getenv("LLM_TRANSLATION_DEBUG_IO")) == "true"
 
 	return &llmTranslator{
 		endpoint:   endpoint,
@@ -72,6 +80,8 @@ func newLLMTranslator(modelOverride string) (*llmTranslator, error) {
 		timeout:    timeout,
 		httpClient: &http.Client{Timeout: timeout},
 		useTools:   useTools,
+		maxRetries: maxRetries,
+		debugIO:    debugIO,
 	}, nil
 }
 
@@ -170,7 +180,7 @@ func translatePerSegment(ctx context.Context, translator *llmTranslator, segment
 			text, err := translator.translateSegment(ctx, segments[idx], source, target, extraContext)
 			status := "done"
 			if err != nil {
-				log.Warn().Err(err).Int("segment", segments[idx].Index()).Dur("duration", time.Since(start)).Msg("LLM segment translation failed")
+				log.Warn().Err(err).Int("segment", segments[idx].Index()).Str("text", excerpt(segments[idx].Text, 100)).Str("model", translator.model).Dur("duration", time.Since(start)).Msg("LLM segment translation failed")
 				results[idx] = segResult{index: idx, err: err}
 				status = "error"
 			} else {
@@ -258,6 +268,7 @@ func translateChunked(ctx context.Context, translator *llmTranslator, segments [
 
 	var mu sync.Mutex
 	var firstErr error
+	var cancelReason error
 	var errs []string
 	var completedSegments int32
 	var failedSegments int32
@@ -284,6 +295,18 @@ func translateChunked(ctx context.Context, translator *llmTranslator, segments [
 
 			select {
 			case <-ctx.Done():
+				mu.Lock()
+				reason := cancelReason
+				if firstErr == nil {
+					firstErr = ctx.Err()
+				}
+				cancelErr := fmt.Sprintf("chunk %d cancelled before processing", c.index+1)
+				if reason != nil {
+					cancelErr = fmt.Sprintf("chunk %d cancelled: %s", c.index+1, reason)
+				}
+				errs = append(errs, fmt.Sprintf("chunk %d (segments %d-%d): %s", c.index+1, c.start+1, c.end, cancelErr))
+				mu.Unlock()
+				log.Warn().Err(ctx.Err()).Int("chunk", c.index+1).Str("segments", fmt.Sprintf("%d-%d", c.start+1, c.end)).Str("reason", cancelErr).Msg("LLM chunk translation cancelled")
 				atomic.AddInt32(&completedSegments, int32(c.end-c.start))
 				if onProgress != nil {
 					onProgress(len(segments), int(atomic.LoadInt32(&completedSegments)), c.start+1, "cancelled")
@@ -301,6 +324,13 @@ func translateChunked(ctx context.Context, translator *llmTranslator, segments [
 
 			log.Info().Int("chunk", c.index+1).Int("segmentStart", c.start+1).Int("segmentEnd", c.end).Msg("LLM translating chunk")
 			items, chunkErr := translator.translateChunk(ctx, chunkSegs, source, target, extraContext)
+			if chunkErr != nil && errors.Is(chunkErr, context.Canceled) {
+				mu.Lock()
+				if cancelReason != nil {
+					chunkErr = fmt.Errorf("chunk cancelled: %w", cancelReason)
+				}
+				mu.Unlock()
+			}
 			if chunkErr == nil && translator.useTools {
 				// Validate tool results — check if all texts are empty
 				emptyCount := 0
@@ -317,6 +347,7 @@ func translateChunked(ctx context.Context, translator *llmTranslator, segments [
 				}
 			}
 			if chunkErr != nil {
+				log.Warn().Err(chunkErr).Int("chunk", c.index+1).Str("endpoint", translator.endpoint).Str("model", translator.model).Str("segments", fmt.Sprintf("%d-%d", c.start+1, c.end)).Msg("LLM chunk translation failed")
 				mu.Lock()
 				if firstErr == nil {
 					firstErr = chunkErr
@@ -326,6 +357,11 @@ func translateChunked(ctx context.Context, translator *llmTranslator, segments [
 				failed := int32(c.end - c.start)
 				atomic.AddInt32(&completedSegments, failed)
 				if atomic.AddInt32(&failedSegments, failed) >= 60 {
+					mu.Lock()
+					if cancelReason == nil {
+						cancelReason = chunkErr
+					}
+					mu.Unlock()
 					cancelFunc()
 				}
 				if onProgress != nil {
@@ -427,6 +463,7 @@ func (t *llmTranslator) translateSegment(ctx context.Context, seg Segment, sourc
 		}
 		return text, nil
 	}
+	log.Warn().Err(lastErr).Int("segment", seg.Index()).Str("text", excerpt(seg.Text, 100)).Str("model", t.model).Str("targetLang", target).Msg("LLM segment exhausted all retries")
 	return "", lastErr
 }
 
@@ -437,6 +474,7 @@ func (t *llmTranslator) translateSegmentWithTool(ctx context.Context, systemProm
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
 		},
+		Stream:      false,
 		Tools:       []toolDefinition{translateSegmentTool},
 		Temperature: 0.2,
 		Thinking:    disableThinking,
@@ -449,8 +487,6 @@ func (t *llmTranslator) translateSegmentWithTool(ctx context.Context, systemProm
 	if err != nil {
 		return "", err
 	}
-
-	respBody = stripDataDone(respBody)
 
 	var result functionCallResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
@@ -529,6 +565,7 @@ func (t *llmTranslator) translateChunk(ctx context.Context, segments []Segment, 
 			lastErr = err
 		}
 		if lastErr != nil {
+			log.Warn().Err(lastErr).Int("segment", i+1).Str("text", excerpt(seg.Text, 100)).Str("model", t.model).Msg("LLM per-segment fallback failed in chunk")
 			return nil, fmt.Errorf("segment %d: %w", i+1, lastErr)
 		}
 	}
@@ -542,6 +579,7 @@ func (t *llmTranslator) translateChunkWithTool(ctx context.Context, systemPrompt
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
 		},
+		Stream:      false,
 		Tools:       []toolDefinition{translateBatchTool},
 		Temperature: 0.2,
 		Thinking:    disableThinking,
@@ -554,8 +592,6 @@ func (t *llmTranslator) translateChunkWithTool(ctx context.Context, systemPrompt
 	if err != nil {
 		return nil, err
 	}
-
-	respBody = stripDataDone(respBody)
 
 	var result functionCallResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
@@ -604,6 +640,7 @@ func (t *llmTranslator) chat(ctx context.Context, systemPrompt, userPrompt strin
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: userPrompt},
 		},
+		Stream:      false,
 		Temperature: 0.2,
 		Thinking:    disableThinking,
 	})
@@ -615,8 +652,6 @@ func (t *llmTranslator) chat(ctx context.Context, systemPrompt, userPrompt strin
 	if err != nil {
 		return "", err
 	}
-
-	respBody = stripDataDone(respBody)
 
 	var result functionCallResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
@@ -631,15 +666,14 @@ func (t *llmTranslator) chat(ctx context.Context, systemPrompt, userPrompt strin
 }
 
 func (t *llmTranslator) requestWithBackoff(ctx context.Context, body []byte, allowToolsFallback bool) ([]byte, error) {
-	const maxRetries = 5
 	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; attempt <= t.maxRetries; attempt++ {
 		if attempt > 0 {
 			backoff := time.Duration(1<<(attempt-1)) * time.Second
 			if backoff > 30*time.Second {
 				backoff = 30 * time.Second
 			}
-			log.Info().Int("attempt", attempt+1).Dur("backoff", backoff).Msg("LLM request retry")
+			log.Info().Err(lastErr).Int("attempt", attempt+1).Int("maxRetries", t.maxRetries).Dur("backoff", backoff).Msg("LLM request retry")
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -647,9 +681,15 @@ func (t *llmTranslator) requestWithBackoff(ctx context.Context, body []byte, all
 			}
 		}
 
+		if t.debugIO {
+			log.Debug().Int("attempt", attempt+1).Bool("tools", allowToolsFallback).Str("endpoint", t.endpoint).Str("model", t.model).Str("request", string(body)).Msg("LLM request")
+		}
+
+		start := time.Now()
 		resp, err := t.doRequest(ctx, body)
 		if err != nil {
 			lastErr = err
+			log.Debug().Err(err).Int("attempt", attempt+1).Dur("duration", time.Since(start)).Msg("LLM request failed")
 			continue
 		}
 
@@ -657,7 +697,12 @@ func (t *llmTranslator) requestWithBackoff(ctx context.Context, body []byte, all
 		resp.Body.Close()
 		if readErr != nil {
 			lastErr = readErr
+			log.Debug().Err(readErr).Int("attempt", attempt+1).Int("status", resp.StatusCode).Dur("duration", time.Since(start)).Msg("LLM response read failed")
 			continue
+		}
+
+		if t.debugIO {
+			log.Debug().Int("attempt", attempt+1).Int("status", resp.StatusCode).Dur("duration", time.Since(start)).Str("response", string(respBody)).Msg("LLM response")
 		}
 
 		if resp.StatusCode >= 400 {
@@ -665,17 +710,21 @@ func (t *llmTranslator) requestWithBackoff(ctx context.Context, body []byte, all
 				t.useTools = false
 				t.toolsTried = true
 				t.resetHTTPClient()
-				log.Debug().Msg("LLM function calling not supported, falling back to chat completion")
+				log.Debug().Int("status", resp.StatusCode).Str("response", excerpt(string(respBody), 500)).Msg("LLM function calling not supported, falling back to chat completion")
 				return nil, fmt.Errorf("tools not supported")
 			}
 			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
 				lastErr = fmt.Errorf("api error %d: %s", resp.StatusCode, excerpt(string(respBody), 200))
+				log.Debug().Err(lastErr).Int("attempt", attempt+1).Int("status", resp.StatusCode).Str("response", excerpt(string(respBody), 500)).Dur("duration", time.Since(start)).Msg("LLM retryable API error")
 				continue
 			}
 			return nil, fmt.Errorf("api error %d: %s", resp.StatusCode, excerpt(string(respBody), 500))
 		}
 
-		return respBody, nil
+		return normalizeResponse(respBody), nil
+	}
+	if lastErr != nil {
+		log.Warn().Err(lastErr).Str("endpoint", t.endpoint).Str("model", t.model).Bool("tools", allowToolsFallback).Int("attempts", t.maxRetries+1).Str("request", excerpt(string(body), 300)).Msg("LLM request exhausted all retries")
 	}
 	return nil, lastErr
 }
@@ -797,12 +846,15 @@ func buildChunkUserPrompt(segments []Segment) string {
 	return fmt.Sprintf("Translate each line below. Keep the same line format with the number prefix.\n%s", userText)
 }
 
-func stripDataDone(body []byte) []byte {
-	s := string(body)
-	if idx := strings.Index(s, "data: [DONE]"); idx >= 0 {
-		s = s[:idx]
+func normalizeResponse(body []byte) []byte {
+	s := strings.TrimSpace(string(body))
+	if s == "" {
+		return body
 	}
-	s = strings.TrimRight(s, "\n\r ")
+
+	if idx := strings.Index(s, "data: [DONE]"); idx >= 0 {
+		s = strings.TrimSpace(s[:idx])
+	}
 	return []byte(s)
 }
 
@@ -941,6 +993,7 @@ var translateBatchTool = toolDefinition{
 type functionCallRequest struct {
 	Model       string           `json:"model"`
 	Messages    []message        `json:"messages"`
+	Stream      bool             `json:"stream"`
 	Tools       []toolDefinition `json:"tools,omitempty"`
 	ToolChoice  interface{}      `json:"tool_choice,omitempty"`
 	Temperature float64          `json:"temperature"`
@@ -957,6 +1010,7 @@ type message struct {
 }
 
 type toolCall struct {
+	Index    int              `json:"index,omitempty"`
 	ID       string           `json:"id"`
 	Type     string           `json:"type"`
 	Function toolCallFunction `json:"function"`
