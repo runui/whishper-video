@@ -68,9 +68,12 @@ LLM_TRANSLATION_TIMEOUT_SECONDS=120
 LLM_TRANSLATION_CHUNK_SIZE=60
 LLM_TRANSLATION_CONCURRENCY=3
 LLM_TRANSLATION_MAX_RETRIES=5
+# LLM_TRANSLATION_SESSION_HISTORY_CHUNKS=1
 ```
 
 For troubleshooting, run the backend with `-dev` and set `LLM_TRANSLATION_DEBUG_IO=true` to log raw LLM request and response bodies. This can include subtitle text, context, and terminology, so only enable it when debugging locally.
+
+Set `LLM_TRANSLATION_SESSION_HISTORY_CHUNKS` to a positive number to include recent chunk source/translation pairs as chat history for better terminology consistency. This mode runs chunks sequentially and increases token usage, so it is disabled by default.
 
 In the translation dialog, choose a subtitle track as the source, select `LLM` as the translation engine, enter a target language such as `zh-CN`, and optionally provide context or terminology. The translated subtitles are saved as a normal subtitle-track translation, so they can be edited and downloaded from the existing UI.
 

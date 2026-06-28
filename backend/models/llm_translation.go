@@ -37,6 +37,17 @@ type llmSegmentResponse struct {
 	Text string `json:"text"`
 }
 
+type llmChunkHistory struct {
+	segments     []Segment
+	translations []llmSegmentResponse
+}
+
+type llmChunkDef struct {
+	index int
+	start int
+	end   int
+}
+
 type llmTranslator struct {
 	endpoint   string
 	apiKey     string
@@ -245,19 +256,19 @@ func translateChunked(ctx context.Context, translator *llmTranslator, segments [
 	ctx, cancelFunc := context.WithCancel(ctx)
 	defer cancelFunc()
 
-	type chunkDef struct {
-		index int
-		start int
-		end   int
-	}
-	chunks := make([]chunkDef, totalChunks)
+	chunks := make([]llmChunkDef, totalChunks)
 	for i := 0; i < totalChunks; i++ {
 		start := i * chunkSize
 		end := start + chunkSize
 		if end > len(segments) {
 			end = len(segments)
 		}
-		chunks[i] = chunkDef{index: i, start: start, end: end}
+		chunks[i] = llmChunkDef{index: i, start: start, end: end}
+	}
+
+	historyChunks := envInt("LLM_TRANSLATION_SESSION_HISTORY_CHUNKS", 0)
+	if historyChunks > 0 {
+		return translateChunkedWithSessionHistory(ctx, translator, segments, chunks, source, target, extraContext, translatedSegments, historyChunks, totalChunks, duration, onProgress)
 	}
 
 	type chunkResult struct {
@@ -278,7 +289,7 @@ func translateChunked(ctx context.Context, translator *llmTranslator, segments [
 	for _, c := range chunks {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(c chunkDef) {
+		go func(c llmChunkDef) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			defer func() {
@@ -427,6 +438,108 @@ func translateChunked(ctx context.Context, translator *llmTranslator, segments [
 	}, nil
 }
 
+func translateChunkedWithSessionHistory(ctx context.Context, translator *llmTranslator, segments []Segment, chunks []llmChunkDef, source, target, extraContext string, translatedSegments []Segment, historyChunks, totalChunks int, duration float64, onProgress TranslationProgressCallback) (Translation, error) {
+	var firstErr error
+	var errs []string
+	var translatedTexts []string
+	var history []llmChunkHistory
+	completedSegments := 0
+	failedSegments := 0
+
+	for _, c := range chunks {
+		select {
+		case <-ctx.Done():
+			return buildChunkedTranslation(source, target, duration, translatedSegments, TranscriptionStatusTranslationError), ctx.Err()
+		default:
+		}
+
+		chunkSegs := segments[c.start:c.end]
+		log.Info().Int("chunk", c.index+1).Int("historyChunks", len(history)).Int("segmentStart", c.start+1).Int("segmentEnd", c.end).Msg("LLM translating chunk with session history")
+		items, chunkErr := translator.translateChunkWithHistory(ctx, chunkSegs, source, target, extraContext, history)
+		if chunkErr != nil {
+			log.Warn().Err(chunkErr).Int("chunk", c.index+1).Str("endpoint", translator.endpoint).Str("model", translator.model).Str("segments", fmt.Sprintf("%d-%d", c.start+1, c.end)).Msg("LLM chunk translation failed")
+			if firstErr == nil {
+				firstErr = chunkErr
+			}
+			errs = append(errs, fmt.Sprintf("chunk %d (segments %d-%d): %s", c.index+1, c.start+1, c.end, chunkErr))
+			failed := c.end - c.start
+			failedSegments += failed
+			completedSegments += failed
+			if onProgress != nil {
+				onProgress(len(segments), completedSegments, c.start+1, "error")
+			}
+			if failedSegments >= 60 {
+				break
+			}
+			continue
+		}
+
+		for i, item := range items {
+			if i >= c.end-c.start {
+				break
+			}
+			segmentIndex := c.start + i
+			translatedSegments[segmentIndex].Text = strings.TrimSpace(item.Text)
+			translatedSegments[segmentIndex].Words = []Word{}
+		}
+		history = append(history, llmChunkHistory{segments: chunkSegs, translations: items[:minInt(len(items), len(chunkSegs))]})
+		if len(history) > historyChunks {
+			history = history[len(history)-historyChunks:]
+		}
+		completedSegments += c.end - c.start
+		if onProgress != nil {
+			onProgress(len(segments), completedSegments, c.end, "done")
+		}
+	}
+
+	for _, seg := range translatedSegments {
+		if seg.Text != "" {
+			translatedTexts = append(translatedTexts, seg.Text)
+		}
+	}
+
+	if firstErr != nil {
+		okSegs := len(segments) - failedSegments
+		detailLines := strings.Join(errs, "\n")
+		summary := fmt.Sprintf("%d/%d segments failed (%d/%d chunks). %d segments OK.\nDetails:\n%s", failedSegments, len(segments), len(errs), totalChunks, okSegs, detailLines)
+		return Translation{
+			SourceLanguage: source,
+			TargetLanguage: target,
+			Status:         TranscriptionStatusTranslationError,
+			Engine:         "llm",
+			Result: WhisperResult{
+				Language: target,
+				Duration: duration,
+				Segments: translatedSegments,
+				Text:     strings.Join(translatedTexts, "\n"),
+			},
+		}, fmt.Errorf("%s", summary)
+	}
+
+	return buildChunkedTranslation(source, target, duration, translatedSegments, TranscriptionStatusDone), nil
+}
+
+func buildChunkedTranslation(source, target string, duration float64, translatedSegments []Segment, status int) Translation {
+	var translatedTexts []string
+	for _, seg := range translatedSegments {
+		if seg.Text != "" {
+			translatedTexts = append(translatedTexts, seg.Text)
+		}
+	}
+	return Translation{
+		SourceLanguage: source,
+		TargetLanguage: target,
+		Status:         status,
+		Engine:         "llm",
+		Result: WhisperResult{
+			Language: target,
+			Duration: duration,
+			Segments: translatedSegments,
+			Text:     strings.Join(translatedTexts, "\n"),
+		},
+	}
+}
+
 func (t *llmTranslator) translateSegment(ctx context.Context, seg Segment, source, target, extraContext string) (string, error) {
 	systemPrompt := buildLLMSystemPrompt(source, target, extraContext)
 	userPrompt := fmt.Sprintf("Translate this subtitle:\n%s", seg.Text)
@@ -572,6 +685,31 @@ func (t *llmTranslator) translateChunk(ctx context.Context, segments []Segment, 
 	return results, nil
 }
 
+func (t *llmTranslator) translateChunkWithHistory(ctx context.Context, segments []Segment, source, target, extraContext string, history []llmChunkHistory) ([]llmSegmentResponse, error) {
+	systemPrompt := buildLLMSystemPrompt(source, target, extraContext)
+	messages := []message{{Role: "system", Content: systemPrompt}}
+	for _, h := range history {
+		if len(h.segments) == 0 || len(h.translations) == 0 {
+			continue
+		}
+		messages = append(messages,
+			message{Role: "user", Content: buildStrictChunkUserPrompt(h.segments)},
+			message{Role: "assistant", Content: buildChunkTranslationResponse(h.segments, h.translations)},
+		)
+	}
+	messages = append(messages, message{Role: "user", Content: buildStrictChunkUserPrompt(segments)})
+
+	content, err := t.chatWithMessages(ctx, messages)
+	if err == nil {
+		items, parseErr := t.parseChunkResult(content, segments)
+		if parseErr == nil && len(items) >= len(segments) {
+			return items[:len(segments)], nil
+		}
+	}
+
+	return t.translateChunk(ctx, segments, source, target, extraContext)
+}
+
 func (t *llmTranslator) translateChunkWithTool(ctx context.Context, systemPrompt, userPrompt string, expectedCount int) ([]llmSegmentResponse, error) {
 	body, err := json.Marshal(functionCallRequest{
 		Model: t.model,
@@ -634,12 +772,16 @@ func (t *llmTranslator) translateChunkWithTool(ctx context.Context, systemPrompt
 }
 
 func (t *llmTranslator) chat(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	return t.chatWithMessages(ctx, []message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userPrompt},
+	})
+}
+
+func (t *llmTranslator) chatWithMessages(ctx context.Context, messages []message) (string, error) {
 	body, err := json.Marshal(functionCallRequest{
-		Model: t.model,
-		Messages: []message{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: userPrompt},
-		},
+		Model:       t.model,
+		Messages:    messages,
 		Stream:      false,
 		Temperature: 0.2,
 		Thinking:    disableThinking,
@@ -829,6 +971,19 @@ func (t *llmTranslator) parseChunkResult(content string, expectedSegments []Segm
 }
 
 func buildChunkUserPrompt(segments []Segment) string {
+	return fmt.Sprintf("Translate each line below. Keep the same line format with the number prefix.\n%s", buildNumberedSegments(segments))
+}
+
+func buildStrictChunkUserPrompt(segments []Segment) string {
+	return "Translate each subtitle line below.\n" +
+		"Return EXACTLY one line per input line.\n" +
+		"Return ONLY this format: N||translated text\n" +
+		"Do not add markdown, bullets, notes, original text, or blank lines.\n" +
+		"Keep the same numbering and order.\n" +
+		buildNumberedSegments(segments)
+}
+
+func buildNumberedSegments(segments []Segment) string {
 	startIdx := 1
 	if len(segments) > 0 && segments[0].ID != "" {
 		if n, err := strconv.Atoi(segments[0].ID); err == nil {
@@ -841,9 +996,29 @@ func buildChunkUserPrompt(segments []Segment) string {
 		idx := startIdx + i
 		sb.WriteString(fmt.Sprintf("%d||%s\n", idx, seg.Text))
 	}
-	userText := sb.String()
+	return sb.String()
+}
 
-	return fmt.Sprintf("Translate each line below. Keep the same line format with the number prefix.\n%s", userText)
+func buildChunkTranslationResponse(segments []Segment, translations []llmSegmentResponse) string {
+	startIdx := 1
+	if len(segments) > 0 && segments[0].ID != "" {
+		if n, err := strconv.Atoi(segments[0].ID); err == nil {
+			startIdx = n + 1
+		}
+	}
+
+	var sb strings.Builder
+	for i, tr := range translations {
+		sb.WriteString(fmt.Sprintf("%d||%s\n", startIdx+i, strings.TrimSpace(tr.Text)))
+	}
+	return sb.String()
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func normalizeResponse(body []byte) []byte {
