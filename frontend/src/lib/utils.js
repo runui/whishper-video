@@ -150,19 +150,19 @@ function triggerDownload(content, filename, mimeType) {
     URL.revokeObjectURL(url);
 }
 
-export const downloadSRT = function (segments, title) {
-    triggerDownload(generateSRT(segments), `${title}.srt`, 'text/plain');
+export const downloadSRT = function (segments, title, lang) {
+    triggerDownload(generateSRT(segments), `${title}_${lang}.srt`, 'text/plain');
 }
 
-export const downloadTXT = function (text, title) {
-    triggerDownload(text, `${title}.txt`, 'text/plain');
+export const downloadTXT = function (text, title, lang) {
+    triggerDownload(text, `${title}_${lang}.txt`, 'text/plain');
 }
 
-export const downloadJSON = function (jsonData, title) {
-    triggerDownload(generateJSON(jsonData), `${title}.json`, 'text/plain');
+export const downloadJSON = function (jsonData, title, lang) {
+    triggerDownload(generateJSON(jsonData), `${title}_${lang}.json`, 'text/plain');
 }
 
-export const downloadVTT = function (segments, title) {
-    triggerDownload(generateVTT(segments), `${title}.vtt`, 'text/plain');
+export const downloadVTT = function (segments, title, lang) {
+    triggerDownload(generateVTT(segments), `${title}_${lang}.vtt`, 'text/plain');
 }
   

@@ -29,12 +29,14 @@
         if (!transcription.skipWhisper || transcription.result?.segments?.length > 0) {
             options.push({ value: 'main:original', label: `✅ Transcription (${transcription.result.language})`, result: transcription.result });
         }
-        for (const translation of transcription.translations || []) {
+        const sortedTranslations = [...(transcription.translations || [])].sort((a, b) => a.targetLanguage.localeCompare(b.targetLanguage));
+        for (const translation of sortedTranslations) {
             options.push({ value: `main:${translation.targetLanguage}`, label: `${engineIcon(translation.engine)} ${translation.targetLanguage}`, result: translation.result });
         }
         for (const track of transcription.subtitleTracks || []) {
             options.push({ value: `subtitle:${track.id}:original`, label: `✅ ${getTrackLabel(track)}`, result: track.result });
-            for (const translation of track.translations || []) {
+            const sortedTrackTranslations = [...(track.translations || [])].sort((a, b) => a.targetLanguage.localeCompare(b.targetLanguage));
+            for (const translation of sortedTrackTranslations) {
                 options.push({ value: `subtitle:${track.id}:${translation.targetLanguage}`, label: `${getTrackLabel(track)} ${engineIcon(translation.engine)} ${translation.targetLanguage}`, result: translation.result });
             }
         }
@@ -45,11 +47,22 @@
         return textOptions.find(option => option.value == selectedText) || textOptions[0];
     }
 
+    function getLanguage() {
+        const parts = selectedText.split(':');
+        const lang = parts[parts.length - 1];
+        if (lang === 'original') {
+            const option = selectedOption();
+            return option?.result?.language || tr?.result?.language || 'original';
+        }
+        return lang;
+    }
+
     function downloadSubtitle() {
         const option = selectedOption();
         const segments = option?.result?.segments || [];
         const text = option?.result?.text || "";
         const title = getMediaTitle(tr);
+        const lang = getLanguage();
         
         if (!option || segments.length == 0 || text == "") {
             toast.error("No data available for download");
@@ -57,13 +70,13 @@
         }
 
         if (subtitleFormat == "srt") {
-            downloadSRT(segments, title);
+            downloadSRT(segments, title, lang);
         } else if (subtitleFormat == "vtt") {
-            downloadVTT(segments, title);
+            downloadVTT(segments, title, lang);
         } else if (subtitleFormat == "json") {
-            downloadJSON(option.result, title);
+            downloadJSON(option.result, title, lang);
         } else if (subtitleFormat == "txt") {
-            downloadTXT(text, title);
+            downloadTXT(text, title, lang);
         }
     }
 
@@ -107,11 +120,16 @@
             return;
         }
 
+        const option = selectedOption();
+        const lang = getLanguage();
+        const title = getMediaTitle(tr);
+        const filename = `${title}_${lang}.${subtitleFormat}`;
+
         async function doWrite(overwrite) {
             const res = await fetch(`${CLIENT_API_HOST}/api/subtitles/${tr.id}/write`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ format: subtitleFormat, content, overwrite })
+                body: JSON.stringify({ format: subtitleFormat, content, filename, overwrite })
             });
             if (res.ok) {
                 const data = await res.json();

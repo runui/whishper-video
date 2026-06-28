@@ -755,6 +755,7 @@ func (s *Server) handleExtractSubtitleTracks(c *fiber.Ctx) error {
 type writeSubtitleRequest struct {
 	Format    string `json:"format"`
 	Content   string `json:"content"`
+	Filename  string `json:"filename"`
 	Overwrite bool   `json:"overwrite"`
 }
 
@@ -766,11 +767,6 @@ func (s *Server) handleWriteSubtitle(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid request")
 	}
 
-	ext := map[string]string{"srt": ".srt", "vtt": ".vtt", "txt": ".txt", "json": ".json"}[req.Format]
-	if ext == "" {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid format")
-	}
-
 	transcription := s.Db.GetTranscription(id)
 	if transcription == nil {
 		return fiber.NewError(fiber.StatusNotFound, "not found")
@@ -779,8 +775,19 @@ func (s *Server) handleWriteSubtitle(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "no local file path")
 	}
 
-	baseName := strings.TrimSuffix(transcription.LocalPath, filepath.Ext(transcription.LocalPath))
-	outputPath := baseName + ext
+	baseDir := filepath.Dir(transcription.LocalPath)
+	var outputPath string
+	if req.Filename != "" {
+		outputPath = filepath.Join(baseDir, req.Filename)
+	} else {
+		ext := map[string]string{"srt": ".srt", "vtt": ".vtt", "txt": ".txt", "json": ".json"}[req.Format]
+		lang := transcription.Language
+		if lang == "" {
+			lang = transcription.Result.Language
+		}
+		baseName := strings.TrimSuffix(transcription.LocalPath, filepath.Ext(transcription.LocalPath))
+		outputPath = baseName + "_" + lang + ext
+	}
 
 	if _, err := os.Stat(outputPath); err == nil && !req.Overwrite {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
