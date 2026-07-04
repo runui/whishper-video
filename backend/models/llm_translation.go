@@ -3,10 +3,14 @@ package models
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
@@ -21,6 +25,10 @@ import (
 const defaultLLMChunkSize = 10
 
 const defaultLLMConcurrency = 3
+
+const defaultLLMContextLimit = 32768
+
+const llmPromptSafetyRatio = 0.7
 
 type LLMTranslationRequest struct {
 	TargetLanguage    string `json:"targetLanguage"`
@@ -59,6 +67,24 @@ type llmTranslator struct {
 	maxRetries int
 	debugIO    bool
 }
+
+type llmRateLimitGate struct {
+	mu         sync.Mutex
+	until      time.Time
+	cooldown   time.Duration
+	lastTripAt time.Time
+}
+
+var sharedLLMRateLimitGate = &llmRateLimitGate{cooldown: time.Second}
+
+type llmMemoryTranslationCache struct {
+	mu    sync.Mutex
+	items map[string]string
+	order []string
+	max   int
+}
+
+var sharedLLMTranslationCache = &llmMemoryTranslationCache{items: map[string]string{}, max: 10000}
 
 func newLLMTranslator(modelOverride string) (*llmTranslator, error) {
 	endpoint := strings.TrimSpace(os.Getenv("LLM_TRANSLATION_ENDPOINT"))
@@ -143,6 +169,7 @@ func TranslateWhisperResultWithLLM(ctx context.Context, result WhisperResult, so
 	}
 
 	if chunkSize > 0 {
+		chunkSize = translator.adaptiveChunkSize(result.Segments, chunkSize)
 		return translateChunked(ctx, translator, result.Segments, source, req.TargetLanguage, combinedContext, translatedSegments, chunkSize, maxConcurrent, result.Duration, onProgress)
 	}
 
@@ -541,12 +568,16 @@ func buildChunkedTranslation(source, target string, duration float64, translated
 }
 
 func (t *llmTranslator) translateSegment(ctx context.Context, seg Segment, source, target, extraContext string) (string, error) {
+	if text, ok := t.getCachedSegment(source, target, extraContext, seg.Text); ok {
+		return text, nil
+	}
 	systemPrompt := buildLLMSystemPrompt(source, target, extraContext)
 	userPrompt := fmt.Sprintf("Translate this subtitle:\n%s", seg.Text)
 
 	if t.useTools {
 		text, err := t.translateSegmentWithTool(ctx, systemPrompt, userPrompt, seg)
 		if err == nil {
+			t.setCachedSegment(source, target, extraContext, seg.Text, text)
 			return text, nil
 		}
 		if t.useTools {
@@ -574,6 +605,7 @@ func (t *llmTranslator) translateSegment(ctx context.Context, seg Segment, sourc
 			lastErr = fmt.Errorf("empty translation")
 			continue
 		}
+		t.setCachedSegment(source, target, extraContext, seg.Text, text)
 		return text, nil
 	}
 	log.Warn().Err(lastErr).Int("segment", seg.Index()).Str("text", excerpt(seg.Text, 100)).Str("model", t.model).Str("targetLang", target).Msg("LLM segment exhausted all retries")
@@ -581,17 +613,10 @@ func (t *llmTranslator) translateSegment(ctx context.Context, seg Segment, sourc
 }
 
 func (t *llmTranslator) translateSegmentWithTool(ctx context.Context, systemPrompt, userPrompt string, seg Segment) (string, error) {
-	body, err := json.Marshal(functionCallRequest{
-		Model: t.model,
-		Messages: []message{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: userPrompt},
-		},
-		Stream:      false,
-		Tools:       []toolDefinition{translateSegmentTool},
-		Temperature: 0.2,
-		Thinking:    disableThinking,
-	})
+	body, err := t.marshalChatRequest([]message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userPrompt},
+	}, []toolDefinition{translateSegmentTool})
 	if err != nil {
 		return "", err
 	}
@@ -634,13 +659,35 @@ func (t *llmTranslator) translateSegmentWithTool(ctx context.Context, systemProm
 }
 
 func (t *llmTranslator) translateChunk(ctx context.Context, segments []Segment, source, target, extraContext string) ([]llmSegmentResponse, error) {
+	results := make([]llmSegmentResponse, len(segments))
+	requestSegments := make([]Segment, 0, len(segments))
+	requestPositions := make([]int, 0, len(segments))
+	for i, seg := range segments {
+		if text, ok := t.getCachedSegment(source, target, extraContext, seg.Text); ok {
+			results[i] = llmSegmentResponse{Text: text}
+			continue
+		}
+		requestSegments = append(requestSegments, seg)
+		requestPositions = append(requestPositions, i)
+	}
+	if len(requestSegments) == 0 {
+		return results, nil
+	}
+
 	systemPrompt := buildLLMSystemPrompt(source, target, extraContext)
-	userPrompt := buildChunkUserPrompt(segments)
+	userPrompt := buildChunkUserPrompt(requestSegments)
 
 	if t.useTools {
-		items, err := t.translateChunkWithTool(ctx, systemPrompt, userPrompt, len(segments))
+		items, err := t.translateChunkWithTool(ctx, systemPrompt, userPrompt, requestSegments)
 		if err == nil {
-			return items, nil
+			missing := missingTranslationCount(items, requestSegments)
+			if missing == 0 {
+				t.cacheChunkResults(source, target, extraContext, requestSegments, items)
+				return mergeChunkResults(results, requestPositions, items), nil
+			}
+			log.Debug().Int("missing", missing).Int("expected", len(requestSegments)).Msg("LLM tool call returned incomplete translations, falling back to chat parsing")
+			t.useTools = false
+			err = fmt.Errorf("incomplete tool translations: %d missing", missing)
 		}
 		// Tools failed or model didn't use them — try parsing the response as text
 		if t.useTools {
@@ -651,15 +698,16 @@ func (t *llmTranslator) translateChunk(ctx context.Context, segments []Segment, 
 	// Try chat + || format parsing first (fast, one API call)
 	content, err := t.chat(ctx, systemPrompt, userPrompt)
 	if err == nil {
-		items, parseErr := t.parseChunkResult(content, segments)
-		if parseErr == nil && len(items) >= len(segments) {
-			return items[:len(segments)], nil
+		items, parseErr := t.parseChunkResult(content, requestSegments)
+		if parseErr == nil && len(items) >= len(requestSegments) {
+			items = items[:len(requestSegments)]
+			t.cacheChunkResults(source, target, extraContext, requestSegments, items)
+			return mergeChunkResults(results, requestPositions, items), nil
 		}
 	}
 
 	// Last resort: translate each segment individually with retry
-	results := make([]llmSegmentResponse, len(segments))
-	for i, seg := range segments {
+	for i, seg := range requestSegments {
 		var lastErr error
 		for attempt := 0; attempt < 3; attempt++ {
 			if attempt > 0 {
@@ -671,7 +719,7 @@ func (t *llmTranslator) translateChunk(ctx context.Context, segments []Segment, 
 			}
 			text, err := t.translateSegment(ctx, seg, source, target, extraContext)
 			if err == nil && strings.TrimSpace(text) != "" {
-				results[i] = llmSegmentResponse{Text: text}
+				results[requestPositions[i]] = llmSegmentResponse{Text: text}
 				lastErr = nil
 				break
 			}
@@ -710,18 +758,12 @@ func (t *llmTranslator) translateChunkWithHistory(ctx context.Context, segments 
 	return t.translateChunk(ctx, segments, source, target, extraContext)
 }
 
-func (t *llmTranslator) translateChunkWithTool(ctx context.Context, systemPrompt, userPrompt string, expectedCount int) ([]llmSegmentResponse, error) {
-	body, err := json.Marshal(functionCallRequest{
-		Model: t.model,
-		Messages: []message{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: userPrompt},
-		},
-		Stream:      false,
-		Tools:       []toolDefinition{translateBatchTool},
-		Temperature: 0.2,
-		Thinking:    disableThinking,
-	})
+func (t *llmTranslator) translateChunkWithTool(ctx context.Context, systemPrompt, userPrompt string, expectedSegments []Segment) ([]llmSegmentResponse, error) {
+	expectedCount := len(expectedSegments)
+	body, err := t.marshalChatRequest([]message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userPrompt},
+	}, []toolDefinition{translateBatchTool})
 	if err != nil {
 		return nil, err
 	}
@@ -754,9 +796,18 @@ func (t *llmTranslator) translateChunkWithTool(ctx context.Context, systemPrompt
 				return nil, fmt.Errorf("parse batch tool args: %w", err)
 			}
 			result := make([]llmSegmentResponse, expectedCount)
+			startIdx := expectedSegmentStartNumber(expectedSegments)
 			for _, tr := range args.Translations {
-				if tr.Index >= 1 && tr.Index <= expectedCount {
-					result[tr.Index-1] = llmSegmentResponse{Text: tr.TranslatedText}
+				slot := tr.Index - startIdx
+				if slot < 0 || slot >= expectedCount {
+					if tr.Index >= 1 && tr.Index <= expectedCount && startIdx != 1 {
+						slot = tr.Index - 1
+					} else {
+						continue
+					}
+				}
+				if strings.TrimSpace(tr.TranslatedText) != "" && result[slot].Text == "" {
+					result[slot] = llmSegmentResponse{Text: tr.TranslatedText}
 				}
 			}
 			return result, nil
@@ -779,13 +830,7 @@ func (t *llmTranslator) chat(ctx context.Context, systemPrompt, userPrompt strin
 }
 
 func (t *llmTranslator) chatWithMessages(ctx context.Context, messages []message) (string, error) {
-	body, err := json.Marshal(functionCallRequest{
-		Model:       t.model,
-		Messages:    messages,
-		Stream:      false,
-		Temperature: 0.2,
-		Thinking:    disableThinking,
-	})
+	body, err := t.marshalChatRequest(messages, nil)
 	if err != nil {
 		return "", err
 	}
@@ -807,6 +852,197 @@ func (t *llmTranslator) chatWithMessages(ctx context.Context, messages []message
 	return strings.TrimSpace(result.Choices[0].Message.Content), nil
 }
 
+func (t *llmTranslator) marshalChatRequest(messages []message, tools []toolDefinition) ([]byte, error) {
+	body := map[string]interface{}{
+		"model":       t.model,
+		"messages":    messages,
+		"stream":      false,
+		"temperature": 0.2,
+	}
+	if len(tools) > 0 {
+		body["tools"] = tools
+	}
+	for key, value := range t.thinkingParams() {
+		body[key] = value
+	}
+	return json.Marshal(body)
+}
+
+func (t *llmTranslator) thinkingParams() map[string]interface{} {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("LLM_TRANSLATION_THINKING")))
+	if mode == "auto" || mode == "omit" {
+		return nil
+	}
+	enabled := mode == "on" || mode == "true" || mode == "enabled" || mode == "1"
+	effort := strings.ToLower(strings.TrimSpace(os.Getenv("LLM_TRANSLATION_THINKING_EFFORT")))
+	if effort != "low" && effort != "medium" && effort != "high" {
+		effort = "high"
+	}
+
+	model := strings.ToLower(t.model)
+	endpoint := strings.ToLower(t.endpoint)
+
+	// DeepSeek / Kimi / Seed / GLM style binary switch. DeepSeek also accepts
+	// reasoning_effort on enabled requests, but disabling with only thinking.type
+	// is safest for broad OpenAI-compatible gateways.
+	if strings.Contains(model, "deepseek") || strings.Contains(model, "kimi") || strings.Contains(model, "moonshot") || strings.Contains(model, "glm") || strings.Contains(model, "zhipu") || strings.Contains(model, "doubao") || strings.Contains(model, "seed") || strings.Contains(endpoint, "deepseek") {
+		if enabled {
+			return map[string]interface{}{"thinking": map[string]string{"type": "enabled"}, "reasoning_effort": effort}
+		}
+		return map[string]interface{}{"thinking": map[string]string{"type": "disabled"}}
+	}
+
+	// OpenAI GPT-5 family and xAI Grok use reasoning_effort.
+	if strings.Contains(model, "gpt-5") || strings.Contains(model, "gpt-chat") || strings.Contains(model, "grok") {
+		if enabled {
+			if strings.Contains(model, "grok") && effort == "medium" {
+				effort = "low"
+			}
+			return map[string]interface{}{"reasoning_effort": effort}
+		}
+		return map[string]interface{}{"reasoning_effort": "none"}
+	}
+
+	// Qwen3-style switch. Budget is intentionally modest for subtitle work.
+	if strings.Contains(model, "qwen") {
+		if enabled {
+			budget := map[string]int{"low": 1024, "medium": 4096, "high": 8192}[effort]
+			return map[string]interface{}{"enable_thinking": true, "thinking_budget": budget}
+		}
+		return map[string]interface{}{"enable_thinking": false}
+	}
+
+	// Unknown provider/model: omit by default. Sending a vendor-specific disable
+	// field to an incompatible OpenAI-compatible server commonly causes 400/422.
+	return nil
+}
+
+func (g *llmRateLimitGate) wait(ctx context.Context) error {
+	g.mu.Lock()
+	remaining := time.Until(g.until)
+	g.mu.Unlock()
+	if remaining <= 0 {
+		return nil
+	}
+	jitter := time.Duration(rand.Intn(1000)) * time.Millisecond
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(remaining + jitter):
+		return nil
+	}
+}
+
+func (g *llmRateLimitGate) trip(retryAfter time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := time.Now()
+	if now.Before(g.until) {
+		return
+	}
+	if retryAfter > 0 {
+		g.cooldown = minDuration(retryAfter, 2*time.Minute)
+	} else if !g.lastTripAt.IsZero() && now.Sub(g.lastTripAt) < 30*time.Second {
+		g.cooldown = minDuration(g.cooldown*2, time.Minute)
+	} else {
+		g.cooldown = time.Second
+	}
+	g.lastTripAt = now
+	g.until = now.Add(g.cooldown)
+	log.Warn().Dur("cooldown", g.cooldown).Msg("LLM rate limit cooldown started")
+}
+
+func parseRetryAfter(header string) time.Duration {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(header); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(header); err == nil {
+		return time.Until(when)
+	}
+	return 0
+}
+
+func isRetryableLLMStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status == http.StatusTooEarly || status >= 500
+}
+
+func (c *llmMemoryTranslationCache) get(key string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.max <= 0 {
+		return "", false
+	}
+	value, ok := c.items[key]
+	return value, ok
+}
+
+func (c *llmMemoryTranslationCache) set(key string, value string) {
+	if strings.TrimSpace(value) == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.max <= 0 {
+		return
+	}
+	if _, exists := c.items[key]; !exists {
+		c.order = append(c.order, key)
+	}
+	c.items[key] = value
+	for len(c.order) > c.max {
+		oldest := c.order[0]
+		c.order = c.order[1:]
+		delete(c.items, oldest)
+	}
+}
+
+func (t *llmTranslator) segmentCacheKey(source, target, extraContext, text string) string {
+	payload := strings.Join([]string{t.model, source, target, extraContext, text}, "\x00")
+	sum := md5.Sum([]byte(payload))
+	return hex.EncodeToString(sum[:])
+}
+
+func (t *llmTranslator) cacheEnabled() bool {
+	return strings.ToLower(strings.TrimSpace(os.Getenv("LLM_TRANSLATION_CACHE"))) != "false"
+}
+
+func (t *llmTranslator) getCachedSegment(source, target, extraContext, text string) (string, bool) {
+	if !t.cacheEnabled() || strings.TrimSpace(text) == "" {
+		return "", false
+	}
+	return sharedLLMTranslationCache.get(t.segmentCacheKey(source, target, extraContext, text))
+}
+
+func (t *llmTranslator) setCachedSegment(source, target, extraContext, text, translation string) {
+	if !t.cacheEnabled() || strings.TrimSpace(text) == "" || strings.TrimSpace(translation) == "" {
+		return
+	}
+	sharedLLMTranslationCache.set(t.segmentCacheKey(source, target, extraContext, text), strings.TrimSpace(translation))
+}
+
+func (t *llmTranslator) cacheChunkResults(source, target, extraContext string, segments []Segment, items []llmSegmentResponse) {
+	for i := range segments {
+		if i >= len(items) {
+			break
+		}
+		t.setCachedSegment(source, target, extraContext, segments[i].Text, items[i].Text)
+	}
+}
+
+func mergeChunkResults(base []llmSegmentResponse, positions []int, items []llmSegmentResponse) []llmSegmentResponse {
+	for i, pos := range positions {
+		if i >= len(items) || pos < 0 || pos >= len(base) {
+			continue
+		}
+		base[pos] = items[i]
+	}
+	return base
+}
+
 func (t *llmTranslator) requestWithBackoff(ctx context.Context, body []byte, allowToolsFallback bool) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= t.maxRetries; attempt++ {
@@ -825,6 +1061,10 @@ func (t *llmTranslator) requestWithBackoff(ctx context.Context, body []byte, all
 
 		if t.debugIO {
 			log.Debug().Int("attempt", attempt+1).Bool("tools", allowToolsFallback).Str("endpoint", t.endpoint).Str("model", t.model).Str("request", string(body)).Msg("LLM request")
+		}
+
+		if err := sharedLLMRateLimitGate.wait(ctx); err != nil {
+			return nil, err
 		}
 
 		start := time.Now()
@@ -855,7 +1095,13 @@ func (t *llmTranslator) requestWithBackoff(ctx context.Context, body []byte, all
 				log.Debug().Int("status", resp.StatusCode).Str("response", excerpt(string(respBody), 500)).Msg("LLM function calling not supported, falling back to chat completion")
 				return nil, fmt.Errorf("tools not supported")
 			}
-			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				return nil, fmt.Errorf("auth error %d: %s", resp.StatusCode, excerpt(string(respBody), 500))
+			}
+			if resp.StatusCode == http.StatusTooManyRequests {
+				sharedLLMRateLimitGate.trip(parseRetryAfter(resp.Header.Get("Retry-After")))
+			}
+			if isRetryableLLMStatus(resp.StatusCode) {
 				lastErr = fmt.Errorf("api error %d: %s", resp.StatusCode, excerpt(string(respBody), 200))
 				log.Debug().Err(lastErr).Int("attempt", attempt+1).Int("status", resp.StatusCode).Str("response", excerpt(string(respBody), 500)).Dur("duration", time.Since(start)).Msg("LLM retryable API error")
 				continue
@@ -892,7 +1138,11 @@ func (t *llmTranslator) doRequest(ctx context.Context, body []byte) (*http.Respo
 
 func (t *llmTranslator) parseChunkResult(content string, expectedSegments []Segment) ([]llmSegmentResponse, error) {
 	expectedCount := len(expectedSegments)
-	result := make([]llmSegmentResponse, 0, expectedCount)
+	if expectedCount == 0 {
+		return nil, nil
+	}
+	startIdx := expectedSegmentStartNumber(expectedSegments)
+	byIndex := make([]string, expectedCount)
 	lines := strings.Split(content, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -901,16 +1151,36 @@ func (t *llmTranslator) parseChunkResult(content string, expectedSegments []Segm
 		}
 		idx := strings.Index(line, "||")
 		if idx >= 0 {
+			num, err := strconv.Atoi(strings.TrimSpace(line[:idx]))
+			if err != nil {
+				continue
+			}
 			text := strings.TrimSpace(line[idx+2:])
-			if text != "" {
-				result = append(result, llmSegmentResponse{Text: text})
+			slot := num - startIdx
+			if slot < 0 || slot >= expectedCount {
+				// Common LLM failure: renumber 1..N even when real segment ids are
+				// larger. Accept it only when the whole chunk starts at 1.
+				if num >= 1 && num <= expectedCount && startIdx != 1 {
+					slot = num - 1
+				} else {
+					continue
+				}
+			}
+			if text != "" && byIndex[slot] == "" {
+				byIndex[slot] = text
 			}
 		}
 	}
+	applyChunkMergeGuard(byIndex, expectedSegments)
+	if completeCount(byIndex, expectedSegments) == expectedCount {
+		return segmentResponsesFromStrings(byIndex), nil
+	}
 
-	// If || format didn't yield enough results, try plain lines
-	if len(result) < expectedCount {
-		result = result[:0]
+	// If || format didn't yield enough results, accept plain lines only when the
+	// model returned exactly one non-explanatory line per segment. Positional
+	// guessing on a different line count silently shifts subtitle timestamps.
+	plain := make([]string, 0, expectedCount)
+	if completeCount(byIndex, expectedSegments) == 0 {
 		for _, line := range lines {
 			line = strings.TrimSpace(line)
 			if line == "" || strings.HasPrefix(line, "```") {
@@ -920,21 +1190,14 @@ func (t *llmTranslator) parseChunkResult(content string, expectedSegments []Segm
 			if strings.Contains(line, "||") {
 				continue
 			}
-			result = append(result, llmSegmentResponse{Text: line})
+			plain = append(plain, line)
 		}
-	}
-
-	if len(result) >= expectedCount {
-		return result[:expectedCount], nil
+		if len(plain) == expectedCount {
+			return segmentResponsesFromStrings(plain), nil
+		}
 	}
 
 	// Retry with explicit format
-	startIdx := 1
-	if len(expectedSegments) > 0 && expectedSegments[0].ID != "" {
-		if n, err := strconv.Atoi(expectedSegments[0].ID); err == nil {
-			startIdx = n + 1
-		}
-	}
 	for retry := 0; retry < 1; retry++ {
 		explicit := make([]string, expectedCount)
 		for i, seg := range expectedSegments {
@@ -946,7 +1209,7 @@ func (t *llmTranslator) parseChunkResult(content string, expectedSegments []Segm
 		if err != nil {
 			continue
 		}
-		retryResult := make([]llmSegmentResponse, 0, expectedCount)
+		retrySlots := make([]string, expectedCount)
 		for _, line := range strings.Split(retryContent, "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
@@ -956,22 +1219,93 @@ func (t *llmTranslator) parseChunkResult(content string, expectedSegments []Segm
 			if idx < 0 {
 				continue
 			}
+			num, err := strconv.Atoi(strings.TrimSpace(line[:idx]))
+			if err != nil {
+				continue
+			}
 			text := strings.TrimSpace(line[idx+2:])
 			if text == "" {
 				continue
 			}
-			retryResult = append(retryResult, llmSegmentResponse{Text: text})
+			slot := num - startIdx
+			if slot >= 0 && slot < expectedCount && retrySlots[slot] == "" {
+				retrySlots[slot] = text
+			}
 		}
-		if len(retryResult) >= expectedCount {
-			return retryResult[:expectedCount], nil
+		applyChunkMergeGuard(retrySlots, expectedSegments)
+		if completeCount(retrySlots, expectedSegments) == expectedCount {
+			return segmentResponsesFromStrings(retrySlots), nil
 		}
 	}
 
-	return nil, fmt.Errorf("llm returned %d lines, expected %d", len(result), expectedCount)
+	return nil, fmt.Errorf("llm returned %d complete lines, expected %d", completeCount(byIndex, expectedSegments), expectedCount)
+}
+
+func expectedSegmentStartNumber(segments []Segment) int {
+	if len(segments) > 0 && segments[0].ID != "" {
+		if n, err := strconv.Atoi(segments[0].ID); err == nil {
+			return n + 1
+		}
+	}
+	return 1
+}
+
+func applyChunkMergeGuard(lines []string, expectedSegments []Segment) {
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) != "" || strings.TrimSpace(expectedSegments[i].Text) == "" {
+			continue
+		}
+		j := i - 1
+		for j >= 0 && strings.TrimSpace(expectedSegments[j].Text) == "" {
+			j--
+		}
+		if j >= 0 && strings.TrimSpace(lines[j]) != "" {
+			lines[j] = ""
+		}
+	}
+}
+
+func completeCount(lines []string, expectedSegments []Segment) int {
+	count := 0
+	for i, line := range lines {
+		if strings.TrimSpace(line) != "" || (i < len(expectedSegments) && strings.TrimSpace(expectedSegments[i].Text) == "") {
+			count++
+		}
+	}
+	return count
+}
+
+func segmentResponsesFromStrings(lines []string) []llmSegmentResponse {
+	items := make([]llmSegmentResponse, len(lines))
+	for i, line := range lines {
+		items[i] = llmSegmentResponse{Text: strings.TrimSpace(line)}
+	}
+	return items
+}
+
+func missingTranslationCount(items []llmSegmentResponse, expectedSegments []Segment) int {
+	missing := 0
+	for i := range expectedSegments {
+		if strings.TrimSpace(expectedSegments[i].Text) == "" {
+			continue
+		}
+		if i >= len(items) || strings.TrimSpace(items[i].Text) == "" {
+			missing++
+		}
+	}
+	return missing
 }
 
 func buildChunkUserPrompt(segments []Segment) string {
-	return fmt.Sprintf("Translate each line below. Keep the same line format with the number prefix.\n%s", buildNumberedSegments(segments))
+	return "Translate each subtitle line below.\n" +
+		"Return EXACTLY one output line for each input line.\n" +
+		"Keep the same number prefix and format: N||translated text\n" +
+		"Do not merge adjacent lines, even when they form one sentence.\n" +
+		"Format example only:\n" +
+		"1||<translation of input line 1>\n" +
+		"2||<translation of input line 2>\n\n" +
+		"Actual input:\n" +
+		buildNumberedSegments(segments)
 }
 
 func buildStrictChunkUserPrompt(segments []Segment) string {
@@ -980,6 +1314,8 @@ func buildStrictChunkUserPrompt(segments []Segment) string {
 		"Return ONLY this format: N||translated text\n" +
 		"Do not add markdown, bullets, notes, original text, or blank lines.\n" +
 		"Keep the same numbering and order.\n" +
+		"Never merge multiple numbered source lines into one translation line.\n" +
+		"A translated line may be empty only if the matching source line is empty.\n" +
 		buildNumberedSegments(segments)
 }
 
@@ -1021,6 +1357,80 @@ func minInt(a, b int) int {
 	return b
 }
 
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func estimateSubtitleTokens(text string) int {
+	runes := []rune(text)
+	if len(runes) == 0 {
+		return 0
+	}
+	cjk := 0
+	for _, r := range runes {
+		if (r >= 0x3400 && r <= 0x4dbf) || (r >= 0x4e00 && r <= 0x9fff) || (r >= 0xf900 && r <= 0xfaff) {
+			cjk++
+		}
+	}
+	other := len(runes) - cjk
+	return int(math.Ceil(float64(cjk)*0.5 + float64(other)*0.25))
+}
+
+func (t *llmTranslator) modelContextLimit() int {
+	model := strings.ToLower(t.model)
+	endpoint := strings.ToLower(t.endpoint)
+	switch {
+	case strings.Contains(model, "gemini"):
+		return 1000000
+	case strings.Contains(model, "claude"):
+		return 200000
+	case strings.Contains(model, "deepseek"), strings.Contains(endpoint, "deepseek"):
+		return 128000
+	case strings.Contains(model, "qwen"), strings.Contains(model, "kimi"), strings.Contains(model, "moonshot"), strings.Contains(model, "gpt-5"), strings.Contains(model, "grok"), strings.Contains(model, "mistral"):
+		return 128000
+	case strings.Contains(model, "minimax"):
+		return 262000
+	default:
+		if v := envInt("LLM_TRANSLATION_CONTEXT_LIMIT", 0); v > 0 {
+			return v
+		}
+		return defaultLLMContextLimit
+	}
+}
+
+func (t *llmTranslator) adaptiveChunkSize(segments []Segment, requested int) int {
+	if requested <= 0 || len(segments) == 0 {
+		return requested
+	}
+	totalTokens := 0
+	for _, seg := range segments {
+		totalTokens += estimateSubtitleTokens(seg.Text) + 6 // line number + delimiters
+	}
+	avgTokens := maxInt(1, totalTokens/len(segments))
+	limit := t.modelContextLimit()
+	reserved := 900 + estimateSubtitleTokens(buildLLMSystemPrompt("", "", ""))
+	safeTokens := int(float64(limit)*llmPromptSafetyRatio) - reserved
+	if safeTokens <= 0 {
+		return requested
+	}
+	safeChunkSize := maxInt(5, safeTokens/avgTokens)
+	if safeChunkSize < requested {
+		log.Info().Int("requested", requested).Int("adaptive", safeChunkSize).Int("avgTokensPerSegment", avgTokens).Int("contextLimit", limit).Str("model", t.model).Msg("LLM chunk size reduced to fit context window")
+		return safeChunkSize
+	}
+	return requested
+}
+
 func normalizeResponse(body []byte) []byte {
 	s := strings.TrimSpace(string(body))
 	if s == "" {
@@ -1055,11 +1465,34 @@ func buildLLMSystemPrompt(source string, target string, extraContext string) str
 		"Translate naturally for the target audience based on context.",
 		"Preserve names, places, brands, and terminology consistently.",
 		"Keep music markers (♪) and sound descriptions when present.",
+		"Preserve subtitle segmentation: never merge, split, reorder, or omit numbered lines.",
+		"Keep translations concise enough for subtitles while preserving meaning.",
+	}
+	if hint := buildTargetLanguageHint(target); hint != "" {
+		parts = append(parts, hint)
 	}
 	if strings.TrimSpace(extraContext) != "" {
 		parts = append(parts, "Context and terminology:", strings.TrimSpace(extraContext))
 	}
 	return strings.Join(parts, "\n")
+}
+
+func buildTargetLanguageHint(target string) string {
+	lang := strings.ToLower(strings.TrimSpace(target))
+	switch lang {
+	case "zh", "zh-cn", "zh_cn", "chinese", "simplified chinese", "mandarin":
+		return "For Chinese subtitles: use natural spoken Chinese, avoid overly formal written style, and keep lines short."
+	case "zh-tw", "zh_tw", "traditional chinese":
+		return "For Traditional Chinese subtitles: use natural spoken Traditional Chinese and keep lines short."
+	case "ja", "japanese":
+		return "For Japanese subtitles: use natural conversational Japanese and appropriate politeness based on character relationships."
+	case "ko", "korean":
+		return "For Korean subtitles: use natural conversational Korean with appropriate honorifics."
+	case "en", "english":
+		return "For English subtitles: use natural idiomatic English, not literal word-for-word phrasing."
+	default:
+		return ""
+	}
 }
 
 func excerpt(value string, limit int) string {
